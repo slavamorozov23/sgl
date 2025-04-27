@@ -1,0 +1,71 @@
+Okay, here is the cleaned text in English, based on the provided Russian source, suitable for an LLM training dataset.
+
+**Wyoming**
+
+Wyoming is a state in the Mountain West subregion of the Western United States. Cheyenne is the capital and most populous city. Its official nickname is the "Equality State" and the official motto is "Equal Rights". Wyoming has the lowest population of any U.S. state.
+
+**State Facts:**
+*   **Motto:** Equal Rights
+*   **Nickname:** Equality State
+*   **Capital:** Cheyenne
+*   **Largest city:** Cheyenne
+*   **Population:** 576,851 (2020) (Rank: 50th)
+*   **Density:** 2.31 people/km² (6.0/sq mi) (Rank: 49th)
+*   **Area Rank:** 10th
+*   **Total Area:** 253,348 km² (97,818 sq mi)
+*   **Water Area:** 1,774.878 km² (685 sq mi) (0.7%)
+*   **Coordinates:** Latitude 41°N to 45°N, Longitude 104°3'W to 111°3'W
+*   **Admission to Union:** July 10, 1890 (44th state)
+*   **Before statehood:** Wyoming Territory
+*   **Governor:** Mark Gordon (R)
+*   **Legislature:** Wyoming Legislature (Senate, House of Representatives)
+*   **U.S. Senators:** Cynthia Lummis (R), John Barrasso (R)
+*   **Time zone:** Mountain Time Zone (UTC−7, DST UTC−6)
+*   **Abbreviation:** WY
+*   **Official website:** wyo.gov
+
+**History**
+Paleo-Indians of the Clovis culture quarried red ocher (hematite) at the Powars II site for about 1,000 years, starting around 12,840 years ago. Artifacts found include stone projectile points, tools, and shell beads. After a possible gap, people associated with the Hell Gap culture began quarrying ocher around 11,600 years ago. The Hell Gap site contains tool points from various complexes including Clovis, Folsom, Plano, Agate Basin, Alberta, Goshen, Hell Gap, Midland, and Cody. The earliest calibrated dates for the Hell Gap and Agate Basin complexes range from 10,200 to 9,600 years BP.
+
+Europeans first reached present-day Wyoming in 1743 (French explorers François and Louis Verendrye). The area became part of the French colony of Louisiana.
+
+In the early 19th century, various Native American tribes inhabited the region, including the Shoshone (primarily west of the Rockies) and the Crow, Cheyenne, and Arapaho (to the east). Their economy was based on nomadic horse-mounted bison hunting. Later, some Lakota groups migrated into eastern Wyoming.
+
+The territory of Wyoming was acquired by the U.S. in the Louisiana Purchase of 1803. John Colter explored the western areas in 1807. Jim Bridger discovered the South Pass through the Rocky Mountains in 1827. John C. Frémont's expedition traversed the South Pass in 1842, establishing it as part of major overland trails to the Pacific coast.
+
+The Wyoming Territory was organized in 1869. The name originates from the Wyoming Valley in Pennsylvania. In 1869, the Wyoming Territory granted women the right to vote, the first government in the U.S. to do so, earning Wyoming the nickname "Equality State". The construction of the Union Pacific Railroad played a significant role in settlement and urbanization.
+
+In 1879, paleontologists discovered Brontosaurus remains in the Late Jurassic Morrison Formation.
+
+Wyoming became the 44th state on July 10, 1890. The state constitution was adopted at the same time. Today, the Eastern Shoshone and Northern Arapaho tribes reside on the Wind River Indian Reservation. Other tribes historically present, such as the Crow, Cheyenne, and Lakota, now primarily live in neighboring states or elsewhere.
+
+**Geography**
+Wyoming covers an area of 253,348 km² (97,818 sq mi), ranking 10th among U.S. states. It is bordered by Montana to the north, South Dakota and Nebraska to the east, Colorado and Utah to the south, and Idaho to the west. Like Colorado and Utah, its borders are defined by lines of latitude and longitude, forming a rectangle.
+
+The western part of Wyoming is covered by the Rocky Mountains, with Gannett Peak being the highest point at 4,207 m (13,804 ft). The state's average elevation is 2,042 m (6,700 ft). The eastern part belongs to the Great Plains, intersected by the Black Hills. The southwest features the Wyoming Basin plains. Major rivers include the Yellowstone, Green River, and Snake River. Notable waterfalls include Yellowstone Falls.
+
+About 16% of the state is forested, with valuable tree species including lodgepole pine, Douglas fir, and quaking aspen.
+
+**Climate**
+Wyoming's climate is continental and semi-arid, with significant temperature variations between summer and winter. Summers are generally warm, with July temperatures reaching 29-37°C (85-99°F) in lower areas, and around 21°C (70°F) at higher elevations. Nights are typically cool even after hot days. Winters are cold, though cold snaps are often interspersed with milder periods due to Chinook winds.
+
+Most precipitation falls in late spring and early summer. The majority of the state receives less than 250 mm (10 inches) of precipitation annually, though some mountain areas receive 510 mm (20 inches) or more, primarily as snow. The highest recorded temperature was 46°C (115°F) in Basin on July 12, 1900; the lowest was -54°C (-66°F) in Riverside on February 9, 1933. Climate varies significantly across the state depending on elevation and topography.
+
+**Population**
+The 2020 U.S. census recorded a population of 576,851. As of July 1, 2011, the estimated population was 568,158, an 0.8% increase from the 2010 census figure of 563,626. As of 2004, 2.2% of the population (11,000 people) were foreign-born. The population density is only 2.6 people/km² (approximately 6.0 people/sq mi), the second lowest after Alaska.
+
+According to the 2000 census, the racial composition was: White 96.19%, African American 1.01%, Native American 3.06%, Asian 0.84%, Pacific Islander 0.13%. The white population is primarily of German, English, Irish, Norwegian, and Swedish ancestry.
+
+Religion (approximate figures): Christian 79% (Protestant 53%, Catholic 16%, Latter-day Saints 10%), Other religions 1%, Unaffiliated 18%.
+
+**Languages**
+As of 2010, 93.39% (474,343) of Wyoming residents aged five and older spoke English at home as their primary language. Other languages spoken included Spanish (4.47% or 22,722 speakers), German (0.35%), and French (0.28%). Less common languages included Algonquian languages (0.18%), Russian (0.10%), Tagalog (0.09%), and Greek (0.09%).
+
+According to the 2007 American Community Survey, 6.2% of the population over five spoke a language other than English at home. Of these, 68.1% spoke English "very well", 16% "well", 10.9% "not well", and 5% "not at all".
+
+**Economy**
+According to the Bureau of Economic Analysis, Wyoming's GDP was $38 billion in 2017. As of 2014, the state's population was experiencing slight growth, particularly in tourist areas like Teton County.
+
+Wyoming is rich in mineral resources, including oil, natural gas, coal, uranium, and trona (possessing the world's largest deposits of natural soda ash). The mining industry has traditionally dominated the state's economy. Oil production began in the 1880s. Uranium deposits, discovered in 1918, have been actively mined since the 1950s. Significant deposits of rare earth elements have also been discovered.
+
+Tourism is another major source of revenue. Key attractions include Yellowstone National Park, Devils Tower National Monument, and Grand Teton National Park.
