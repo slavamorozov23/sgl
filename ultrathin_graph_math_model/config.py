@@ -20,13 +20,13 @@ MLA_DECOUPLED_KEY_DIM = 64  # Dimension for decoupled keys after RoPE (dʰᴿ)
 MLA_COMPRESS_QUERY = True  # Optional query compression in MLA
 
 # Pre-Training (Parameters for math-train)
-PRETRAIN_BATCH_SIZE = 16  # larger batch for quick convergence
+PRETRAIN_BATCH_SIZE = 4  # larger batch for quick convergence
 PRETRAIN_LEARNING_RATE = 3e-5
-PRETRAIN_EPOCHS = 20  # fewer epochs for fast tests
-PRETRAIN_LEARNING_DIR = "deepmind_math_arithmetic"
-PRETRAINED_MODEL_SAVE_PATH = "spatial_graph_math_model.pth"
+PRETRAIN_EPOCHS = 2  # fewer epochs for fast tests
+PRETRAIN_LEARNING_DIR = os.path.join(os.path.dirname(__file__), "..", "deepmind_math_arithmetic")
+PRETRAINED_MODEL_SAVE_PATH = "output_models/spatial_graph_math_model.pth"
 WARMUP_STEPS = 500  # Количество шагов (батчей) для линейного разогрева LR
-DATASET_PERCENTAGE = 0.05 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
+DATASET_PERCENTAGE = 0.01 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
 IGNORE_INDEX = -100 # Used for masking labels
 
 # Common / Device
@@ -40,7 +40,7 @@ REPETITION_PENALTY = 1.1  # >1.0 to penalize repeated tokens (1.0 = no penalty)
 REPETITION_WINDOW = -1    # consider all previous tokens; set >0 to limit window length
 
 # Spatial Graph Specific
-POINTS_JSON_PATH = "points.json"  # Path to graph configuration JSON
+POINTS_JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "points.json")  # Path to graph configuration JSON
 EXIT_TOKEN_INDEX = -1
 ROUTING_SAFETY_LIMIT = 10
 MAX_CUBES_PER_PATH = 3

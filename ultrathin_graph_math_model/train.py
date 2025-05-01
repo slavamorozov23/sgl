@@ -76,21 +76,6 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
     )
 
     processed_batches = 0
-    viz_paths_path = config.VIZ_PATHS_FILE
-    mode = 'w' if epoch == 0 else 'a'
-    paths_file = None
-
-    # Setup path visualization file
-    if viz_paths_path:
-        try:
-            os.makedirs(os.path.dirname(viz_paths_path), exist_ok=True)
-            paths_file = open(viz_paths_path, mode)
-            action = 'Truncated/Created' if epoch == 0 else 'Opened'
-            console.log(f"{action} paths file: {viz_paths_path}")
-        except Exception as e:
-            console.print(f"[yellow]Warning: Could not open paths file: {e}. Skipping path saving.[/yellow]")
-    else:
-        console.print("[yellow]Warning: config.VIZ_PATHS_FILE is empty. Skipping path saving.[/yellow]")
 
     scaler = GradScaler()
     limit_messages = [] # List to collect messages about max cubes limit

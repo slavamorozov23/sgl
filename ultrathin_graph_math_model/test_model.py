@@ -83,7 +83,7 @@ def test_model(args):
         tokenizer.pad_token = tokenizer.eos_token
     console.log(f"Tokenizer vocab size: {tokenizer.vocab_size}")
     device = config.DEVICE
-    model_path = os.path.join(os.getcwd(), 'spatial_graph_math_model.pth')
+    model_path = config.PRETRAINED_MODEL_SAVE_PATH
     # load checkpoint state and derive model architecture
     # load only weights to avoid pickle warnings
     state = torch.load(model_path, map_location=device, weights_only=True)

@@ -472,6 +472,7 @@ if __name__ == "__main__":
                     console.log(f"[bold green]Validation loss improved ({best_val_loss:.4f} -> {avg_val_loss:.4f}). Saving model...[/]", style="green")
                     best_val_loss = avg_val_loss
                     try:
+                        os.makedirs(os.path.dirname(config.PRETRAINED_MODEL_SAVE_PATH), exist_ok=True)
                         torch.save(model.state_dict(), config.PRETRAINED_MODEL_SAVE_PATH)
                         console.log(f"Model saved to {config.PRETRAINED_MODEL_SAVE_PATH}")
                     except Exception as e:
