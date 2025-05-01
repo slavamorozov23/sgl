@@ -15,6 +15,7 @@ from torch.amp import autocast, GradScaler
 from rich.live import Live
 from rich.text import Text
 from rich.console import Group
+from torch.optim.lr_scheduler import SequentialLR  # Add scheduler import
 
 console = Console()
 
@@ -42,7 +43,7 @@ def init_redis():
 if __name__ == "__main__" or multiprocessing.current_process().name == 'MainProcess':
     init_redis()
 
-def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
+def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, scheduler: SequentialLR):  # Accept scheduler
     model.train()
     total_loss = 0
     total_cubes_used = 0
@@ -57,41 +58,12 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
          num_batches = -1
          console.print("[yellow]Warning: Dataloader does not support len(). Progress is indeterminate.[/yellow]")
 
-    # Save visualization data only on the first epoch
-    if epoch == 0:
-        viz_pos_path = config.VIZ_POSITIONS_FILE
-        if viz_pos_path:
-            if not os.path.exists(viz_pos_path):
-                try:
-                    cube_positions_list = model.cube_positions.cpu().numpy().tolist()
-                    os.makedirs(os.path.dirname(viz_pos_path), exist_ok=True)
-                    with open(viz_pos_path, 'w') as f:
-                        json.dump(cube_positions_list, f)
-                    console.log(f"Saved cube positions to {viz_pos_path}")
-                except Exception as e:
-                     console.print(f"[yellow]Warning: Could not save cube positions: {e}[/yellow]")
-        else:
-            console.print("[yellow]Warning: config.VIZ_POSITIONS_FILE is empty.[/yellow]")
-
-        viz_start_path = config.VIZ_START_CANDIDATES_FILE
-        if viz_start_path:
-            try:
-                start_candidates_list = model.entry_exit_list
-                os.makedirs(os.path.dirname(viz_start_path), exist_ok=True)
-                with open(viz_start_path, 'w') as f:
-                    json.dump(start_candidates_list, f)
-                console.log(f"Saved start candidates to {viz_start_path}")
-            except AttributeError:
-                 console.print(f"[yellow]Warning: Model missing 'entry_exit_list'. Skipping start candidates save.[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not save start candidates: {e}[/yellow]")
-        else:
-            console.print("[yellow]Warning: config.VIZ_START_CANDIDATES_FILE is empty.[/yellow]")
-
     # Setup progress bar
     progress_columns = [
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeRemainingColumn(), TimeElapsedColumn(),
+        TextColumn("Loss: {task.fields[loss]:.4f}"),
+        TextColumn("Acc: {task.fields[acc]:.2f}%"),
     ]
     epoch_progress = Progress(*progress_columns, console=console)
     task_id = epoch_progress.add_task(
@@ -121,11 +93,9 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
         console.print("[yellow]Warning: config.VIZ_PATHS_FILE is empty. Skipping path saving.[/yellow]")
 
     scaler = GradScaler()
-    additional_info_text = Text("")
-    renderable = Group(epoch_progress, additional_info_text)
-
-    # Training loop with Live display
-    with Live(renderable, refresh_per_second=10):
+    limit_messages = [] # List to collect messages about max cubes limit
+    # Training loop with Progress only
+    with epoch_progress:
         for i, batch in enumerate(dataloader):
             input_ids = batch['input_ids'].to(device)
             labels = batch['labels'].to(device)
@@ -134,11 +104,15 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
 
             # Forward pass with autocast
             with autocast(device_type=device.type):
-                logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss = model(input_ids)
+                logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_cubes_limit_reached = model(input_ids)
                 main_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 loss = main_loss \
                      + config.AUX_LOSS_WEIGHT * aux_variance_loss \
                      + config.LOAD_BALANCING_LOSS_WEIGHT * aux_load_balancing_loss
+
+            # Check the flag returned by the model
+            if max_cubes_limit_reached:
+                limit_messages.append(f"Batch {i+1}: Max cubes per path ({config.MAX_CUBES_PER_PATH}) reached. Path truncated due to cube-use limit.")
 
             if torch.isnan(loss) or torch.isinf(loss):
                  console.print(f"[red]Warning: NaN/Inf loss at batch {i}. Skipping update.[/red]")
@@ -148,8 +122,41 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+
+            nan_inf_found = False
+            zero_grad_found = True  # Предположим, что все нулевые, пока не найдем ненулевой
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                # Проверка на NaN/Inf
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    nan_inf_found = True
+                    break  # Прерываем проверку, если нашли NaN/Inf
+                # Проверка на ненулевой градиент
+                if p.grad.norm().item() > 1e-9:
+                    zero_grad_found = False
+            # Логируем результат проверки градиентов
+            if nan_inf_found:
+                console.log(f"[bold red]Batch {i}: NaN/Inf градиенты обнаружены! Шаг оптимизатора будет пропущен.[/bold red]")
+            elif zero_grad_found:
+                console.log(f"[yellow]Batch {i}: Все градиенты нулевые или близкие к нулю. Нет сигнала обучения?[/yellow]")
+            else:
+                if i % 10 == 0:
+                    console.log(f"[green]Batch {i}: Градиенты в норме.[/green]")
+            # Условное выполнение шага оптимизатора
+            if not nan_inf_found:
+                scaler.step(optimizer)
+                scaler.update()
+                # --- НОВОЕ: Шаг планировщика после оптимизатора ---
+                scheduler.step()
+                # --- Конец нового шага планировщика ---
+                if i % 50 == 0:  # Optional LR logging
+                    current_lr = optimizer.param_groups[0]['lr']
+                    console.log(f"[LR Step {i}] Current LR: {current_lr:.8f}")
+            else:
+                # Если были NaN/Inf, пропускаем шаг и обязательно обнуляем градиенты
+                optimizer.zero_grad()
+                scaler.update()  # Важно: всегда обновлять scaler, даже если шаг пропущен
 
             processed_batches += 1
             total_loss += loss.item()
@@ -266,12 +273,12 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
                         question_token_ids = input_ids_list[:input_ids_list.index(pad_token_id)]
                     else:
                         question_token_ids = input_ids_list
-                # True first answer token
+                # Найти первый целевой токен (не IGNORE_INDEX)
                 true_first_a_token_id = config.IGNORE_INDEX
-                if 'newline_idx' in locals() and newline_idx + 1 < len(labels_list):
-                    val = labels_list[newline_idx+1]
-                    if val != config.IGNORE_INDEX:
-                        true_first_a_token_id = val
+                for tok in labels_list:
+                    if tok != config.IGNORE_INDEX:
+                        true_first_a_token_id = tok
+                        break
                 # Secondary forward pass for next token
                 predicted_first_a_token_id = -1
                 if question_token_ids:
@@ -297,27 +304,33 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
                 predicted_str_new = f"Predict#1: N/A (error: {e})"
             # --- КОНЕЦ: Формирование Predicted строки ---
 
-            # Update dynamic display
-            additional_info_text.plain = "\n".join([
-                f"Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%",
-                f"Aux Var Loss: {aux_variance_loss.item():.4f}",
-                f"Aux LB Loss: {aux_load_balancing_loss.item():.4f}",
-                f"Path: {path_str}",
-                f"Q (Batch[0]): {first_q}",
-                f"A (Batch[0]): {first_a}",
-                predicted_str_new,
-            ])
-
-            # Save paths data (original file logic)
-            # This logic is now replaced by sending to Redis
-            # if paths_file:
-            #     try:
-            #         hist = list(cubes_visited_history)
-            #         transitions = [[hist[j], hist[j+1]] for j in range(len(hist)-1)]
-            #         paths_file.write(json.dumps({"epoch":epoch,"batch":i,"path":hist,"trans":transitions})+"\n")
-            #         if i%100==0: paths_file.flush()
-            #     except:
-            #         paths_file=None
+            # Debug printout (every 20 batches or if anomaly)
+            if i % 20 == 0 or nan_inf_found or zero_grad_found:
+                console.print(f"--- Batch {i+1} Debug Info ---")
+                # Print collected limit messages
+                for msg in limit_messages:
+                    console.print(f"  [yellow]{msg}[/yellow]")
+                limit_messages = [] # Clear the list after printing
+                console.print(f"  Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%")
+                console.print(f"  Aux Var Loss: {aux_variance_loss.item():.4f}")
+                console.print(f"  Aux LB Loss: {aux_load_balancing_loss.item():.4f}")
+                path_display = path_str[:100] + ('...' if len(path_str) > 100 else '')
+                console.print(f"  Path: {path_display}")
+                console.print(f"  Q (Batch[0]): {first_q}")
+                console.print(f"  A (Batch[0]): {first_a}")
+                console.print(f"  {predicted_str_new}")
+                # --- Новая строка: уверенность в правильном токене ---
+                try:
+                    if 'pred_pos' in locals() and 'target_id' in locals():
+                        # logits: [batch, seq, vocab], берем [0, pred_pos, :]
+                        import torch.nn.functional as F
+                        true_logits = logits[0, pred_pos, :]
+                        probs = F.softmax(true_logits, dim=-1)
+                        prob_true = probs[target_id].item()
+                        console.print(f"  Model confidence in TRUE token: {prob_true*100:.2f}%")
+                except Exception as e:
+                    console.print(f"  [yellow]Could not compute confidence: {e}[/yellow]")
+                console.print("-" * 25)
 
             # --- Отправка данных о пути в Redis ---
             if redis_client: # Отправляем только если есть соединение
@@ -327,11 +340,15 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device):
                     batch_size = input_ids.size(0)
                     paths = [path_data for _ in range(batch_size)]
 
-                    # Формируем данные для отправки
+                    # Формируем данные для отправки с метриками
                     message_data = {
                         "epoch": epoch,
                         "batch_index": i,
                         "paths": paths,
+                        "avg_loss": avg_loss,
+                        "acc_target": avg_acc,
+                        "aux_var_loss": aux_variance_loss.item(),
+                        "aux_lb_loss": aux_load_balancing_loss.item(),
                     }
 
                     # Сериализуем в JSON (байты)

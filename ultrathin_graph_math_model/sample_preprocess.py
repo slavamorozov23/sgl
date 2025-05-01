@@ -11,7 +11,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 console = Console()
 
 # === 1. Настройки ===
-MODEL_NAME = getattr(config, 'MODEL_NAME', 'gpt2')
+MODEL_NAME = getattr(config, 'TOKENIZER_NAME', 'gpt2')
 MAX_SEQ_LEN = getattr(config, 'MAX_SEQ_LEN', 256)
 IGNORE_INDEX = getattr(config, 'IGNORE_INDEX', -100)
 

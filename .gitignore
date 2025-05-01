@@ -192,6 +192,7 @@ __pycache__/
 
 # Private or temporary data
 *.json
+memory-bank/
 !README*.json
 !LICENSE*.json
 *.pth

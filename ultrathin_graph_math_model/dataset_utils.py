@@ -84,22 +84,22 @@ def process_batch_for_math_mp(batch, show_samples=False, stage1_mode=False):
         # --- Two-stage logic for labels ---
         labels_final = np.full(max_seq_len_mp, ignore_index_mp, dtype=np.int64)
         if stage1_mode:
-            # --- Stage 1: Only penultimate token is target ---
+            # --- Stage 1: Only penultimate non-<eos> token is target ---
             original_len = len(ids_truncated)
-            if original_len >= 2:
-                second_last_token_idx = original_len - 2
-                label_pos = second_last_token_idx
+            # Need at least [ ..., answer_token, eos ]
+            if original_len >= 3:
+                eos_idx = original_len - 1
+                penult_idx = original_len - 2  # index of last answer token
+                label_pos = penult_idx - 1     # predict that answer token from previous input step
                 if 0 <= label_pos < max_seq_len_mp:
-                    if second_last_token_idx + 1 < len(ids_truncated):
-                        target_token_id = ids_truncated[second_last_token_idx + 1]
-                        labels_final[label_pos] = target_token_id
-                    else:
-                        if len(debug_messages) < 10:
-                            debug_messages.append("Warning: Sequence too short for second-to-last token logic.")
+                    target_token_id = ids_truncated[penult_idx]
+                    labels_final[label_pos] = target_token_id
                 else:
                     if len(debug_messages) < 10:
-                        debug_messages.append("Warning: Target position for second-to-last token exceeds max_seq_len.")
-            # else: leave all ignore_index
+                        debug_messages.append("Warning: Calculated label_pos for stage1 outside max_seq_len.")
+            else:
+                if len(debug_messages) < 10:
+                    debug_messages.append("Warning: Sequence too short for stage1 mode (need >=3 tokens).")
         else:
             # --- Stage 2: Standard logic (all answer tokens after newline) ---
             answer_tokens = ids_truncated[newline_idx+1:]

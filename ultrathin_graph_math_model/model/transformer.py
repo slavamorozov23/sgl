@@ -27,7 +27,12 @@ class SpatialGraphTransformer(nn.Module):
         console.log(f"Loading graph configuration from: {json_path}")
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
-                points_data = json.load(f)
+                raw = json.load(f)
+            # Support new format where points are under 'points' key
+            if isinstance(raw, dict) and 'points' in raw:
+                points_data = raw['points']
+            else:
+                points_data = raw
             if not isinstance(points_data, list) or not points_data:
                 raise ValueError("JSON data must be a non-empty list of points.")
         except FileNotFoundError:
@@ -118,188 +123,126 @@ class SpatialGraphTransformer(nn.Module):
                 if param.dim() > 1 and 'weight' in name:
                     param.data.uniform_(-initrange, initrange)
 
-    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int, List[int], torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, int, List[int], torch.Tensor, torch.Tensor, bool]:
+        """
+        Forward pass: per-sample routing.
+        Returns:
+            logits: Tensor [bsz, seq_len, vocab_size]
+            cubes_used_count: int
+            cubes_visited_history: List[int]
+            aux_variance_loss: Tensor
+            aux_load_balancing_loss: Tensor
+            max_cubes_limit_reached: bool
+        """
         bsz, seq_len = input_ids.shape
         print_debug = False
 
         if seq_len > self.max_seq_len:
             input_ids = input_ids[:, :self.max_seq_len]
             seq_len = self.max_seq_len
-        x = self.token_embedding(input_ids) * math.sqrt(self.d_model)
-        x = self.dropout_emb(x)
-        current = random.choice(self.start_candidates)
-        visited: Set[int] = {current}
-        history: List[int] = [current]
-        visit_counts = Counter({current: 1})  # track uses per cube
-        trans: List[Tuple[int,int]] = []
-        steps = 0
 
-        if print_debug: console.print(f"\n--- [DEBUG BATCH] Start Routing from: {current} ---", style="bold blue")
+        x_emb = self.token_embedding(input_ids) * math.sqrt(self.d_model)
+        x_emb = self.dropout_emb(x_emb)
 
-        # Initialize accumulators for auxiliary loss
-        accumulated_probs_sum = torch.zeros(self.num_cubes + 1, device=x.device)
-        total_steps_with_probs = 0
-        accumulated_load_balancing_loss = torch.tensor(0.0, device=x.device)
-        total_routing_steps = 0
+        x_out = x_emb.clone()
+        device = x_out.device
 
-        while True:
-            if steps >= config.ROUTING_SAFETY_LIMIT:
-                # ... (обработка лимита) ...
-                break
+        current_cubes = torch.tensor([random.choice(self.start_candidates) for _ in range(bsz)], device=device)
+        active_mask = torch.ones(bsz, dtype=torch.bool, device=device)
+        steps = torch.zeros(bsz, dtype=torch.long, device=device)
+        visit_counts = [Counter() for _ in range(bsz)]
+        for i in range(bsz):
+            visit_counts[i][current_cubes[i].item()] = 1
 
-            # --- ДИАГНОСТИКА: ШАГ РОУТИНГА ---
-            if print_debug and steps < 10: # Ограничим вывод первыми 10 шагами
-                console.print(f"  [Step {steps}] Current Cube: {current}", style="blue")
+        history0 = [current_cubes[0].item()]
+        max_limit_reached = False
 
-            cube = self.cubes[current]
-            x = cube(x, freqs_cis=self.freqs_cis, print_debug=print_debug)
-            if print_debug and steps < 10:
-                if hasattr(cube.self_attn, 'kv_cache') and cube.self_attn.kv_cache is not None:
-                    console.print(f"  [Step {steps}] MLA KV Cache Size: {cube.self_attn.kv_cache.shape}", style="cyan")
+        accumulated_probs_sum = torch.zeros(self.num_cubes + 1, device=device)
+        accumulated_load_balancing_term = torch.tensor(0.0, device=device)
+        total_active_routing_steps = 0
+
+        while active_mask.any():
+            active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(1)
+            processed_x = torch.zeros_like(x_out[active_indices])
+            for cube_idx in range(self.num_cubes):
+                mask_k = current_cubes[active_indices] == cube_idx
+                if mask_k.any():
+                    rel_idx = torch.nonzero(mask_k, as_tuple=False).squeeze(1)
+                    inp_k = x_out[active_indices[rel_idx]]
+                    out_k = self.cubes[cube_idx](inp_k, freqs_cis=self.freqs_cis, print_debug=print_debug)
+                    processed_x[rel_idx] = out_k
+            x_out[active_indices] = processed_x
+
+            scores_active = self.gate(x_out[active_indices])
+
+            temp = getattr(config, 'ROUTING_TEMPERATURE', 1.0)
+            if temp > 0:
+                probs_active = F.softmax(scores_active / temp, dim=-1)
+                accumulated_probs_sum += probs_active.sum(dim=0)
+                avg_probs = probs_active.mean(dim=0)
+                lb = (self.num_cubes + 1) * torch.sum(avg_probs.pow(2))
+                accumulated_load_balancing_term += lb
+                total_active_routing_steps += probs_active.size(0)
+
+            chosen_next = torch.full_like(current_cubes[active_indices], config.EXIT_TOKEN_INDEX)
+            for idx, global_i in enumerate(active_indices.tolist()):
+                cur = current_cubes[global_i].item()
+                neigh = self.neighbor_map.get(cur, [])
+
+                min_len = max(1, math.ceil(self.num_cubes * config.MIN_PATH_LENGTH_RATIO))
+                orig_filtered = [n for n in neigh if not (len(visit_counts[global_i]) < min_len and n == config.EXIT_TOKEN_INDEX)]
+                if not orig_filtered:
+                    continue
+
+                filtered = [n for n in orig_filtered if visit_counts[global_i].get(n, 0) < config.MAX_CUBES_PER_PATH]
+                if not filtered:
+                    max_limit_reached = True
+                    continue
+
+                map_idx = []
+                inv_map = {}
+                for j, n in enumerate(filtered):
+                    idx_score = self.num_cubes if n == config.EXIT_TOKEN_INDEX else n
+                    map_idx.append(idx_score)
+                    inv_map[j] = n
+                idx_t = torch.tensor(map_idx, device=device, dtype=torch.long)
+                sample_scores = scores_active[idx, idx_t]
+
+                if random.random() < config.ROUTING_EPSILON_GREEDY:
+                    sel = random.randrange(len(filtered))
                 else:
-                    console.print(f"  [Step {steps}] MLA KV Cache: None", style="cyan")
-            scores = self.gate(x)
+                    sel = torch.argmax(sample_scores).item()
+                chosen_next[idx] = inv_map[sel]
 
-            # Calculate and accumulate probabilities for auxiliary loss
-            temperature = getattr(config, 'ROUTING_TEMPERATURE', 1.0)
-            if temperature > 0:
-                temp_scores = scores / temperature
-                full_probs_this_step = F.softmax(temp_scores, dim=-1) # [bsz, num_cubes + 1]
-                avg_probs_per_target_step = full_probs_this_step.mean(dim=0) # [num_cubes + 1]
-                num_choices = self.num_cubes + 1
-                sum_squared_probs = torch.sum(avg_probs_per_target_step * avg_probs_per_target_step)
-                step_load_balancing_loss = num_choices * sum_squared_probs
-                accumulated_load_balancing_loss = accumulated_load_balancing_loss + step_load_balancing_loss
-                total_routing_steps += 1
-                accumulated_probs_sum += avg_probs_per_target_step
-                total_steps_with_probs += 1
+            steps[active_indices] += 1
 
-            # Получаем соседей
-            neigh = self.neighbor_map.get(current, [])
-            if print_debug and steps < 10:
-                console.print(f"    Original Neighbors: {neigh}", style="cyan")
+            if active_mask[0]:
+                pos0 = (active_indices == 0).nonzero(as_tuple=False)
+                if pos0.numel() > 0:
+                    next0 = chosen_next[pos0.item()]
+                    history0.append(next0.item())
 
-            # ... (логика фильтрации соседей) ...
-            min_len = max(1, math.ceil(self.num_cubes * config.MIN_PATH_LENGTH_RATIO))
-            filtered_neigh = list(neigh)
-            removed_exit = False
-            if len(history) < min_len:
-                if config.EXIT_TOKEN_INDEX in filtered_neigh:
-                    filtered_neigh.remove(config.EXIT_TOKEN_INDEX)
-                    removed_exit = True
+            exit_mask = chosen_next == config.EXIT_TOKEN_INDEX
+            limit_mask = steps[active_indices] >= config.ROUTING_SAFETY_LIMIT
+            stop_mask = exit_mask | limit_mask
+            cont_mask = ~stop_mask
+            cont_idx = active_indices[cont_mask]
+            current_cubes[cont_idx] = chosen_next[cont_mask]
+            for idx, global_i in enumerate(active_indices.tolist()):
+                if cont_mask[idx]:
+                    visit_counts[global_i][chosen_next[idx].item()] += 1
+            active_mask[active_indices[stop_mask]] = False
 
-            if print_debug and steps < 10:
-                console.print(f"    Filtered Neighbors (min_len={min_len}, hist={len(history)}, removed_exit={removed_exit}): {filtered_neigh}", style="cyan")
-
-            if not filtered_neigh:
-                 # ... (обработка отсутствия соседей) ...
-                 break
-
-            # Enforce max uses per cube in this path
-            filtered_neigh = [n for n in filtered_neigh if visit_counts.get(n, 0) < config.MAX_CUBES_PER_PATH]
-            if not filtered_neigh:
-                console.print(f"[bold red]Max cubes per path ({config.MAX_CUBES_PER_PATH}) reached for all neighbors. Ending route.[/]", style="red")
-                break
-
-            neighbor_score_indices = []
-            original_neighbor_indices_map = {}
-            for i, n_idx in enumerate(filtered_neigh):
-                # ... (логика получения score_idx) ...
-                if n_idx == config.EXIT_TOKEN_INDEX: score_idx = self.num_cubes
-                elif 0 <= n_idx < self.num_cubes: score_idx = n_idx
-                else: continue
-                neighbor_score_indices.append(score_idx)
-                original_neighbor_indices_map[i] = n_idx
-
-            if not neighbor_score_indices:
-                 # ... (обработка отсутствия индексов) ...
-                 break
-
-            idx_tensor = torch.tensor(neighbor_score_indices, device=scores.device, dtype=torch.long)
-            neighbor_scores = scores[:, idx_tensor].mean(dim=0)
-
-            # Apply neighbor biases
-            # Removed neighbor bias application as the mechanism is being removed.
-
-            temperature = getattr(config, 'ROUTING_TEMPERATURE', 1.0)
-
-            # --- ДИАГНОСТИКА: ОЦЕНКИ И ВЕРОЯТНОСТИ ---
-            if print_debug and steps < 10:
-                console.print(f"      Neighbor Scores: {neighbor_scores.detach().cpu().numpy()}", style="green")
-                console.print(f"      Temperature: {temperature}", style="green")
-
-            if temperature <= 0:
-                if print_debug and steps < 10: console.print(f"      Mode: Argmax (T <= 0)", style="yellow")
-                chosen_relative_idx = torch.argmax(neighbor_scores).item()
-            else:
-                probs = F.softmax(neighbor_scores / temperature, dim=-1)
-                # --- ДИАГНОСТИКА: ВЕРОЯТНОСТИ ---
-                if print_debug and steps < 10:
-                     console.print(f"      Probabilities: {probs.detach().cpu().numpy()}", style="magenta")
-
-                if torch.isnan(probs).any() or torch.isinf(probs).any():
-                    if print_debug and steps < 10: console.print(f"      Mode: Fallback (NaN/Inf) -> Uniform", style="red")
-                    chosen_relative_idx = random.randrange(len(filtered_neigh))
-                else:
-                    try:
-                        if print_debug and steps < 10: console.print(f"      Mode: Multinomial Sampling", style="yellow")
-                        chosen_relative_idx = torch.multinomial(probs, num_samples=1).item()
-                    except RuntimeError as e:
-                        if print_debug and steps < 10: console.print(f"      Mode: Fallback (Multinomial Error {e}) -> Argmax", style="red")
-                        chosen_relative_idx = torch.argmax(neighbor_scores).item()
-
-            # --- ДИАГНОСТИКА: ВЫБОР ---
-            if chosen_relative_idx >= len(filtered_neigh):
-                 console.print(f"[bold red]      ERROR: chosen_relative_idx {chosen_relative_idx} out of bounds for filtered_neigh {filtered_neigh}[/]")
-                 # Handle error - perhaps break or choose randomly from what's available
-                 if filtered_neigh:
-                     chosen_relative_idx = random.randrange(len(filtered_neigh))
-                 else: # Should not happen if checks above work
-                      break
-            next_cube = filtered_neigh[chosen_relative_idx]
-
-            if print_debug and steps < 10:
-                console.print(f"      Chosen Relative Idx: {chosen_relative_idx}", style="bold green")
-                console.print(f"      --> Next Cube: {next_cube}", style="bold green")
-            # ---- КОНЕЦ ИЗМЕНЕННОЙ ЛОГИКИ ----
-
-            trans.append((current, next_cube))
-
-            # Update neighbor biases based on visited path
-            # Removed neighbor bias update as the mechanism is being removed.
-
-            if next_cube == config.EXIT_TOKEN_INDEX:
-                if print_debug: console.print(f"  [Step {steps+1}] EXIT token chosen. Route ended.", style="bold blue")
-                break
-
-            # Update neighbor biases based on visited path
-            # Update neighbor biases based on visited path
-            # Removed neighbor bias update as the mechanism is being removed.
-
-            visited.add(next_cube)
-            history.append(next_cube)
-            visit_counts[next_cube] = visit_counts.get(next_cube, 0) + 1
-            current = next_cube
-            steps += 1
-
-        # Calculate auxiliary routing loss after the loop
-        if total_routing_steps > 0:
-            final_load_balancing_loss = accumulated_load_balancing_loss / total_routing_steps
+        if total_active_routing_steps > 0:
+            avg_probs_per_target = accumulated_probs_sum / total_active_routing_steps
+            aux_variance_loss = torch.var(avg_probs_per_target)
+            aux_load_balancing_loss = accumulated_load_balancing_term / total_active_routing_steps
         else:
-            final_load_balancing_loss = torch.tensor(0.0, device=x.device)
+            aux_variance_loss = torch.tensor(0.0, device=device)
+            aux_load_balancing_loss = torch.tensor(0.0, device=device)
 
-        if total_steps_with_probs > 0:
-            avg_probs_per_target = accumulated_probs_sum / total_steps_with_probs # Avg over steps [num_cubes+1]
-            # Loss: Variance of these average probabilities (encourage balance)
-            # Smaller variance means more balanced probabilities.
-            aux_routing_loss = torch.var(avg_probs_per_target)
-        else:
-            aux_routing_loss = torch.tensor(0.0, device=x.device) # No routing steps, no aux loss
-
-        # Apply final_norm and fc_out to x
-        x = self.final_norm(x)
-        logits = self.fc_out(x)
-
-        if print_debug: console.print(f"--- [DEBUG BATCH] Final Path: {history} (Length: {len(history)}) ---", style="bold blue")
-
-        return logits, len(history), history, aux_routing_loss, final_load_balancing_loss
+        x_final = self.final_norm(x_out)
+        logits = self.fc_out(x_final)
+        cubes_used_count = len(history0)
+        cubes_visited_history = history0
+        return logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_limit_reached

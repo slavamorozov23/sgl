@@ -20,7 +20,7 @@ from typing import List, Tuple, Set
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
 from transformers import AutoTokenizer
-from torch.optim.lr_scheduler import CosineAnnealingLR # Import scheduler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR # Import scheduler
 
 import config
 from model import SpatialGraphTransformer
@@ -39,7 +39,7 @@ class MathDataset(Dataset):
         self.stage1_mode = stage1_mode
         os.makedirs(cache_dir, exist_ok=True)
         safe_tokenizer_name = re.sub(r'[\\/*?:"<>|]', '_', tokenizer.name_or_path)
-        fname = f"math_{split}_tok_{safe_tokenizer_name}_seq{max_seq_len}_v3_nonl.h5"
+        fname = f"math_{split}_add_sub_tok_{safe_tokenizer_name}_seq{max_seq_len}_v3_nonl.h5"
         self.cache_path = os.path.join(cache_dir, fname)
 
         self._all_examples = []
@@ -94,7 +94,7 @@ class MathDataset(Dataset):
             raw = None
             with console.status("Loading raw math dataset...", spinner="dots"):
                 try:
-                    raw = load_dataset("math_dataset", "arithmetic__mixed", split=split, cache_dir=config.PRETRAIN_LEARNING_DIR, trust_remote_code=True)
+                    raw = load_dataset("math_dataset", "arithmetic__mul", split=split, cache_dir=config.PRETRAIN_LEARNING_DIR, trust_remote_code=True)
                     console.log(f"Raw dataset '{split}' split loaded with {len(raw)} examples.")
                 except Exception as e:
                     console.print(f"[bold red]Failed to load raw dataset: {e}[/]")
@@ -258,9 +258,6 @@ class MathDataset(Dataset):
              raise IndexError(f"Index {idx} out of bounds for current sample size {len(self.examples)}")
         # Переобработка батча на лету с нужным режимом
         example = self.examples[idx]
-        # Если пример уже содержит input_ids/labels как torch.Tensor — возвращаем как есть
-        if isinstance(example["input_ids"], torch.Tensor):
-            return example
         # Иначе — обработать через process_batch_for_math_mp с нужным stage1_mode
         batch = {"question": [example["original_q"]], "answer": [example["original_a"]]}
         out, _ = process_batch_for_math_mp(batch, show_samples=False, stage1_mode=self.stage1_mode)
@@ -337,6 +334,8 @@ if __name__ == "__main__":
 
         config.VOCAB_SIZE = tokenizer.vocab_size
         console.log(f"Tokenizer: {config.TOKENIZER_NAME}, Vocab size: {config.VOCAB_SIZE}")
+        # Инициализация глобальных переменных для обработки батчей
+        init_math_worker(tokenizer, config.MAX_SEQ_LEN, config.IGNORE_INDEX)
 
         model = SpatialGraphTransformer(
             d_model=config.D_MODEL,
@@ -348,8 +347,21 @@ if __name__ == "__main__":
         ).to(config.DEVICE)
         console.log(f"Loaded model with {model.num_cubes} cubes from JSON config.")
         console.log(f"Model initialized on {config.DEVICE}")
-        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        console.log(f"Trainable parameters: {num_params / 1_000_000:.2f} M")
+
+        # Calculate trainable parameters based on ROUTING_SAFETY_LIMIT
+        global_params = sum(p.numel() for name, p in model.named_parameters() if p.requires_grad and not name.startswith('cubes.'))
+        # Assuming all cubes have the same structure and trainable parameters
+        if model.num_cubes > 0:
+            modular_params_per_cube = sum(p.numel() for name, p in model.cubes[0].named_parameters() if p.requires_grad)
+        else:
+            modular_params_per_cube = 0
+            console.print("[yellow]Warning: No cubes in the model. Modular parameters per cube is 0.[/yellow]")
+
+        max_active_params = global_params + config.ROUTING_SAFETY_LIMIT * modular_params_per_cube
+        console.log(f"Trainable parameters (max active based on ROUTING_SAFETY_LIMIT={config.ROUTING_SAFETY_LIMIT}): {max_active_params / 1_000_000:.2f} M")
+        console.log(f"Global parameters: {global_params / 1_000_000:.2f} M")
+        console.log(f"Modular parameters per cube: {modular_params_per_cube / 1_000_000:.2f} M")
+
 
         # --- Two-stage training flags ---
         stage1_complete = False
@@ -391,7 +403,31 @@ if __name__ == "__main__":
              console.log("Validation Dataloader: Empty")
 
         optim = torch.optim.AdamW(model.parameters(), lr=config.PRETRAIN_LEARNING_RATE, weight_decay=0.01)
-        scheduler = CosineAnnealingLR(optim, T_max=config.PRETRAIN_EPOCHS, eta_min=1e-5) # Initialize scheduler
+
+        # --- НАЧАЛО: Настройка Warmup и Планировщика ---
+        warmup_steps = config.WARMUP_STEPS
+        try:
+            steps_per_epoch = len(dl)
+            total_training_steps = config.PRETRAIN_EPOCHS * steps_per_epoch
+            main_scheduler_steps = total_training_steps - warmup_steps
+            console.log(f"Scheduler: Warmup for {warmup_steps} steps.")
+            if main_scheduler_steps > 0:
+                console.log(f"           Then CosineAnnealing for {main_scheduler_steps} steps.")
+            else:
+                console.log(f"[yellow]Warning: Warmup steps ({warmup_steps}) >= total estimated steps ({total_training_steps}). Cosine Annealing might not activate effectively.[/yellow]")
+                main_scheduler_steps = 1
+        except TypeError:
+            console.print("[yellow]Warning: Could not determine steps per epoch from DataLoader.")
+            console.print(f"           Warmup will run for {warmup_steps} steps (from config).")
+            console.print("           CosineAnnealing T_max will be approximate (using PRETRAIN_EPOCHS * 1000 estimate). Adjust if needed.")
+            estimated_total_steps = config.PRETRAIN_EPOCHS * 1000
+            main_scheduler_steps = max(1, estimated_total_steps - warmup_steps)
+
+        scheduler_warmup = LinearLR(optim, start_factor=1e-9, end_factor=1.0, total_iters=warmup_steps)
+        scheduler_main = CosineAnnealingLR(optim, T_max=main_scheduler_steps, eta_min=1e-6)
+        scheduler = SequentialLR(optim, schedulers=[scheduler_warmup, scheduler_main], milestones=[warmup_steps])
+        # --- КОНЕЦ: Настройка Warmup и Планировщика ---
+
         crit = nn.CrossEntropyLoss(ignore_index=config.IGNORE_INDEX)
 
         console.rule("[bold blue]Start Training[/]")
@@ -416,10 +452,7 @@ if __name__ == "__main__":
                 console.print("[yellow]Warning: Training dataloader is empty for this epoch after resampling. Skipping training phase.[/yellow]")
                 continue
 
-            avg_train_loss = train(model, dl, optim, crit, epoch, config.PRETRAIN_EPOCHS, config.DEVICE)
-
-            scheduler.step() # Step the scheduler
-            console.log(f"Learning rate updated to {scheduler.get_last_lr()[0]:.6f}") # Log learning rate
+            avg_train_loss = train(model, dl, optim, crit, epoch, config.PRETRAIN_EPOCHS, config.DEVICE, scheduler)
 
             # Validation Phase
             avg_val_loss = float('inf')
