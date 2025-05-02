@@ -211,7 +211,29 @@ class SpatialGraphTransformer(nn.Module):
                 if random.random() < config.ROUTING_EPSILON_GREEDY:
                     sel = random.randrange(len(filtered))
                 else:
-                    sel = torch.argmax(sample_scores).item()
+                    # --- НАЧАЛО ИЗМЕНЕНИЙ ---
+                    sample_probs = F.softmax(sample_scores, dim=-1)
+                    try:
+                        if torch.isnan(sample_probs).any() or torch.isinf(sample_probs).any():
+                            print(f"Warning: NaN/Inf in sample_probs for item {global_i}. Falling back to argmax.")
+                            sel_idx_tensor = torch.argmax(sample_scores, dim=-1)
+                        else:
+                            if sample_probs.sum() < 1e-6:
+                                print(f"Warning: Sum of sample_probs is near zero for item {global_i}. Falling back to argmax.")
+                                sel_idx_tensor = torch.argmax(sample_scores, dim=-1)
+                            else:
+                                sel_idx_tensor = torch.multinomial(sample_probs, num_samples=1)
+                        sampled_index_in_filtered = sel_idx_tensor.item()
+                        sel = inv_map[sampled_index_in_filtered]
+                    except RuntimeError as e:
+                        print(f"Error during multinomial sampling for item {global_i}: {e}. Falling back to argmax.")
+                        sel_idx_tensor = torch.argmax(sample_scores, dim=-1)
+                        sampled_index_in_filtered = sel_idx_tensor.item()
+                        if sampled_index_in_filtered in inv_map:
+                            sel = inv_map[sampled_index_in_filtered]
+                        else:
+                            continue
+                    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
                 chosen_next[idx] = inv_map[sel]
 
             steps[active_indices] += 1
