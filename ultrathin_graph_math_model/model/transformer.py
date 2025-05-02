@@ -224,13 +224,13 @@ class SpatialGraphTransformer(nn.Module):
                             else:
                                 sel_idx_tensor = torch.multinomial(sample_probs, num_samples=1)
                         sampled_index_in_filtered = sel_idx_tensor.item()
-                        sel = inv_map[sampled_index_in_filtered]
+                        sel = sampled_index_in_filtered
                     except RuntimeError as e:
                         print(f"Error during multinomial sampling for item {global_i}: {e}. Falling back to argmax.")
                         sel_idx_tensor = torch.argmax(sample_scores, dim=-1)
                         sampled_index_in_filtered = sel_idx_tensor.item()
                         if sampled_index_in_filtered in inv_map:
-                            sel = inv_map[sampled_index_in_filtered]
+                            sel = sampled_index_in_filtered
                         else:
                             continue
                     # --- КОНЕЦ ИЗМЕНЕНИЙ ---
