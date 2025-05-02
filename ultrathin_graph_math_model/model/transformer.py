@@ -13,6 +13,7 @@ from rich.console import Console
 console = Console()
 from collections import Counter, defaultdict
 import json
+from metrics import metrics
 
 class SpatialGraphTransformer(nn.Module):
     def __init__(self, d_model: int, dim_feedforward: int,
@@ -267,4 +268,15 @@ class SpatialGraphTransformer(nn.Module):
         logits = self.fc_out(x_final)
         cubes_used_count = len(history0)
         cubes_visited_history = history0
-        return logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_limit_reached
+
+        # Retrieve and reset latency metrics from the global collector
+        metrics_data = metrics.get_and_reset()
+        ffn_time = metrics_data.get('ffn_time', 0.0)
+        ffn_calls = metrics_data.get('ffn_calls', 0)
+        mla_time = metrics_data.get('mla_time', 0.0)
+        mla_calls = metrics_data.get('mla_calls', 0)
+        gate_time = metrics_data.get('gate_time', 0.0)
+        gate_calls = metrics_data.get('gate_calls', 0)
+
+        # Return all 12 values
+        return logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_limit_reached, ffn_time, ffn_calls, mla_time, mla_calls, gate_time, gate_calls

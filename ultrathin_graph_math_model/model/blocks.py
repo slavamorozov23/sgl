@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 import config
+from metrics import metrics
 
 
 class RMSNorm(nn.Module):
@@ -31,6 +32,7 @@ class SpatialCubeLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, freqs_cis: Optional[torch.Tensor], print_debug: bool = False) -> torch.Tensor:
+        metrics.start('ffn')
         # 1. FFN блок
         residual_1 = x
         normed_x_ffn = self.norm1(x)
@@ -39,12 +41,15 @@ class SpatialCubeLayer(nn.Module):
         ff_hidden = gate * value
         ff_output = self.linear2(ff_hidden)
         x = residual_1 + self.dropout2(ff_output) # Используем dropout2 для FFN
+        metrics.end('ffn')
 
+        metrics.start('mla')
         # 2. MLA блок
         residual_2 = x
         normed_x_attn = self.norm2(x)
         attn_output = self.self_attn(normed_x_attn, is_causal=True, freqs_cis=freqs_cis, print_debug=print_debug)
         x = residual_2 + self.dropout1(attn_output) # Используем dropout1 для Attention
+        metrics.end('mla')
 
         return x
 
@@ -55,6 +60,9 @@ class Gate(nn.Module):
         self.linear = nn.Linear(d_model, num_cubes + 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        metrics.start('gate')
         # Calculate mean representation across the sequence length dimension
         sequence_representation = x.mean(dim=1)  # Shape: [batch_size, d_model]
-        return self.linear(sequence_representation)
+        out = self.linear(sequence_representation)
+        metrics.end('gate')
+        return out

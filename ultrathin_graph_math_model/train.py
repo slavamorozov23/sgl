@@ -16,6 +16,7 @@ from rich.live import Live
 from rich.text import Text
 from rich.console import Group
 from torch.optim.lr_scheduler import SequentialLR  # Add scheduler import
+from metrics import metrics # Import metrics collector
 
 console = Console()
 
@@ -76,6 +77,10 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
     )
 
     processed_batches = 0
+    # sliding-window latency aggregators
+    window_ffn_time = window_mla_time = window_gate_time = 0.0
+    window_ffn_calls = window_mla_calls = window_gate_calls = 0
+    window_batches = 0
 
     scaler = GradScaler()
     limit_messages = [] # List to collect messages about max cubes limit
@@ -89,11 +94,22 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
 
             # Forward pass with autocast
             with autocast(device_type=device.type):
-                logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_cubes_limit_reached = model(input_ids)
+                # Model forward pass - now returns 12 values including metrics
+                logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_cubes_limit_reached, ffn_time, ffn_calls, mla_time, mla_calls, gate_time, gate_calls = model(input_ids)
+
                 main_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 loss = main_loss \
                      + config.AUX_LOSS_WEIGHT * aux_variance_loss \
                      + config.LOAD_BALANCING_LOSS_WEIGHT * aux_load_balancing_loss
+
+            # Accumulate latency metrics for the sliding window
+            window_ffn_time += ffn_time
+            window_ffn_calls += ffn_calls
+            window_mla_time += mla_time
+            window_mla_calls += mla_calls
+            window_gate_time += gate_time
+            window_gate_calls += gate_calls
+            window_batches += 1
 
             # Check the flag returned by the model
             if max_cubes_limit_reached:
@@ -102,6 +118,18 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
             if torch.isnan(loss) or torch.isinf(loss):
                  console.print(f"[red]Warning: NaN/Inf loss at batch {i}. Skipping update.[/red]")
                  continue
+
+            # Log latency metrics every 10 batches
+            if window_batches >= 10: # Use window_batches counter
+                avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
+                avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
+                avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
+                console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
+
+                # Reset window accumulators
+                window_ffn_time = window_mla_time = window_gate_time = 0.0
+                window_ffn_calls = window_mla_calls = window_gate_calls = 0
+                window_batches = 0
 
             # Backward pass and optimization step
             scaler.scale(loss).backward()
@@ -126,8 +154,22 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
             elif zero_grad_found:
                 console.log(f"[yellow]Batch {i}: Все градиенты нулевые или близкие к нулю. Нет сигнала обучения?[/yellow]")
             else:
+                # Keep original gradient log
                 if i % 10 == 0:
                     console.log(f"[green]Batch {i}: Градиенты в норме.[/green]")
+
+            # Log latency metrics every 10 batches
+            if window_batches >= 10: # Use window_batches counter
+                avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
+                avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
+                avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
+                console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
+
+                # Reset window accumulators
+                window_ffn_time = window_mla_time = window_gate_time = 0.0
+                window_ffn_calls = window_mla_calls = window_gate_calls = 0
+                window_batches = 0
+
             # Условное выполнение шага оптимизатора
             if not nan_inf_found:
                 scaler.step(optimizer)
