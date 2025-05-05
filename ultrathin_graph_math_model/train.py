@@ -101,7 +101,39 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
                 # Model forward pass - now returns 12 values including metrics
                 logits, cubes_used_count, cubes_visited_history, aux_variance_loss, aux_load_balancing_loss, max_cubes_limit_reached, ffn_time, ffn_calls, mla_time, mla_calls, gate_time, gate_calls = model(input_ids)
 
-                main_loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                # --- START: Conditional Label Masking ---
+                if config.TRAIN_ON_LAST_ANSWER_TOKEN_ONLY:
+                    # Get EOS token ID
+                    eos_id = tokenizer_utils.get_eos_token_id()
+                    if eos_id is None:
+                        console.print("[red]Error: EOS token ID not found, cannot apply TRAIN_ON_LAST_ANSWER_TOKEN_ONLY logic.[/red]")
+                        # Fallback to using original labels if EOS is missing
+                        current_labels = labels
+                    else:
+                        # Create a mask filled with ignore_index
+                        masked_labels = torch.full_like(labels, config.IGNORE_INDEX)
+                        # Iterate over each sequence in the batch
+                        for b_idx in range(labels.size(0)):
+                            # Find indices of all EOS tokens in the current sequence
+                            eos_indices = (labels[b_idx] == eos_id).nonzero(as_tuple=True)[0]
+                            # If at least one EOS token is found
+                            if eos_indices.numel() > 0:
+                                # Get the index of the *first* EOS token
+                                first_eos_idx = eos_indices[0].item()
+                                # If the EOS token is not the very first token in the sequence
+                                if first_eos_idx > 0:
+                                    # The target index is the one right before the first EOS
+                                    target_idx = first_eos_idx - 1
+                                    # Copy the original label value to the masked labels at the target position
+                                    masked_labels[b_idx, target_idx] = labels[b_idx, target_idx]
+                        current_labels = masked_labels
+                else:
+                    # If the flag is False, use the original labels
+                    current_labels = labels
+                # --- END: Conditional Label Masking ---
+
+                # Calculate main loss using potentially masked labels
+                main_loss = criterion(logits.view(-1, logits.size(-1)), current_labels.view(-1))
                 loss = main_loss \
                      + config.AUX_LOSS_WEIGHT * aux_variance_loss \
                      + config.LOAD_BALANCING_LOSS_WEIGHT * aux_load_balancing_loss
@@ -206,8 +238,10 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
             # Calculate batch accuracy
             with torch.no_grad():
                 preds = logits.argmax(dim=-1)
-                mask = labels != config.IGNORE_INDEX
-                batch_correct = ((preds == labels) & mask).sum().item()
+                # Use the potentially masked labels (current_labels) for accuracy calculation mask
+                mask = current_labels != config.IGNORE_INDEX
+                # Compare predictions with the potentially masked labels
+                batch_correct = ((preds == current_labels) & mask).sum().item()
                 batch_total = mask.sum().item()
                 batch_acc = (batch_correct / batch_total) * 100 if batch_total > 0 else 0.0
 
@@ -233,183 +267,60 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
 
             # --- ИЗМЕНЕНО: Условное выполнение всего блока отладки батча ---
             if config.LOG_BATCH_DEBUG_INFO:
-                # Prepare dynamic logging text (for first item in batch)
-                try:
-                    input_ids_list = input_ids[0].cpu().tolist()
-                    labels_list = labels[0].cpu().tolist()
-                    # tokenizer = dataloader.dataset.tokenizer # Больше не получаем токенизатор так
-                    # Используем tokenizer_utils напрямую
+                # --- НОВАЯ ЛОГИКА: Отладка согласно ТЗ ---
+                target_tokens_str = "N/A"
+                predicted_tokens_str = "N/A"
+                input_sequence_str = "N/A"
+                import numpy as np # Добавим импорт numpy здесь
+
+                try: # Внешний try для всего блока новой логики
+                    # 1. Декодируем входную последовательность
+                    input_ids_np = input_ids[0].cpu().numpy()
+                    labels_np = labels[0].cpu().numpy()
+                    # Убедимся, что preds на CPU перед конвертацией в numpy
+                    preds_np = preds[0].cpu().numpy()
+
                     pad_token_id = tokenizer_utils.get_pad_token_id()
-                    eos_token_id = tokenizer_utils.get_eos_token_id()
-                    effective_pad_id = pad_token_id if pad_token_id is not None else eos_token_id # Используем EOS как запасной
-                    ignore_index = config.IGNORE_INDEX
-
-                    # Decode display input
-                    disp_ids = [t for t in input_ids_list if t != effective_pad_id]
-                    # input_text_display = tokenizer.decode(disp_ids, skip_special_tokens=False).strip()
-                    input_text_display = tokenizer_utils.decode(disp_ids).strip() # skip_special_tokens=False по умолчанию
-
-                    # Decode prediction task
-                    valid_idxs = [j for j,v in enumerate(labels_list) if v!=ignore_index]
-                    if valid_idxs:
-                        pred_pos = valid_idxs[0]
-                        pre_ids = [t for t in input_ids_list[:pred_pos+1] if t!=effective_pad_id]
-                        # task_context = tokenizer.decode(pre_ids, skip_special_tokens=False).strip()
-                        task_context = tokenizer_utils.decode(pre_ids).strip()
-                        target_id = labels_list[pred_pos]
-                        # target_str = tokenizer.decode([target_id], skip_special_tokens=False)
-                        target_str = tokenizer_utils.decode([target_id])
+                    # Убираем паддинг из input_ids для декодирования
+                    actual_input_ids = [token_id for token_id in input_ids_np if token_id != pad_token_id]
+                    if actual_input_ids:
+                        input_sequence_str = tokenizer_utils.decode(actual_input_ids)
                     else:
-                        task_context = input_text_display
-                        target_str = ""
+                        input_sequence_str = "[Empty Sequence after Padding Removal]"
 
-                    # Reconstruct full question before '='
-                    # eq = tokenizer.encode("=", add_special_tokens=False)[0]
-                    eq = tokenizer_utils.encode("=")[0] # add_special_tokens=False по умолчанию
-                    if eq in input_ids_list:
-                        q_tokens = input_ids_list[:input_ids_list.index(eq)]
-                        # question = tokenizer.decode(q_tokens, skip_special_tokens=False).strip()
-                        question = tokenizer_utils.decode(q_tokens).strip()
+                    # 2. Находим позиции и ID целевых токенов
+                    target_indices = np.where(labels_np != config.IGNORE_INDEX)[0]
+                    if target_indices.size > 0:
+                        target_token_ids = labels_np[target_indices]
+                        target_tokens_str = tokenizer_utils.decode(target_token_ids.tolist())
+
+                        # 3. Получаем предсказанные ID для целевых позиций
+                        predicted_token_ids = preds_np[target_indices]
+                        predicted_tokens_str = tokenizer_utils.decode(predicted_token_ids.tolist())
                     else:
-                        question = input_text_display
-                except Exception as log_err:
-                    input_text_display, task_context, target_str, question = f"Err:{log_err}", "", "", ""
+                        target_tokens_str = "[No Target Tokens]"
+                        predicted_tokens_str = "[No Target Tokens]"
 
-                # --- НАЧАЛО: Код для извлечения Q/A из batch ---
-                first_q = "N/A"
-                first_a = "N/A"
-                try:
-                    if isinstance(batch, dict) and \
-                       'original_q' in batch and batch['original_q'] and \
-                       'original_a' in batch and batch['original_a']:
+                    # 4. Вывод отладочной информации (каждые 20 батчей или при аномалиях)
+                    if i % 20 == 0 or nan_inf_found or zero_grad_found:
+                        console.print(f"--- Batch {i+1} Debug Info ---")
+                        for msg in limit_messages: console.print(f"  [yellow]{msg}[/yellow]")
+                        limit_messages = [] # Очищаем сообщения после вывода
+                        console.print(f"  Input Sequence (Q_A<eos>): {repr(input_sequence_str)}")
+                        console.print(f"  Target Tokens: {repr(target_tokens_str)}")
+                        console.print(f"  Predicted Tokens: {repr(predicted_tokens_str)}")
+                        path_display = path_str[:100] + ('...' if len(path_str) > 100 else '')
+                        console.print(f"  Path: {path_display}")
+                        console.print(f"  Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%")
+                        console.print(f"  Aux Var Loss: {aux_variance_loss.item():.4f}")
+                        console.print(f"  Aux LB Loss: {aux_load_balancing_loss.item():.4f}")
+                        console.print("-" * 25)
 
-                        q_data = batch['original_q'][0]
-                        a_data = batch['original_a'][0]
-
-                        # Декодируем, если это байты (из HDF5 кэша)
-                        if isinstance(q_data, bytes):
-                            first_q = q_data.decode('utf-8', errors='ignore')
-                        elif isinstance(q_data, str):
-                            first_q = q_data
-                        else:
-                            first_q = str(q_data)
-
-                        if isinstance(a_data, bytes):
-                            first_a = a_data.decode('utf-8', errors='ignore')
-                        elif isinstance(a_data, str):
-                            first_a = a_data
-                        else:
-                            first_a = str(a_data)
-
-                        # Ограничим длину для вывода
-                        first_q = first_q[:80] + "..." if len(first_q) > 80 else first_q
-                        first_a = first_a[:80] + "..." if len(first_a) > 80 else first_a
-                except Exception as e:
-                    pass # Оставляем N/A
-                # --- КОНЕЦ: Код для извлечения Q/A из batch ---
-
-                # --- НАЧАЛО: Формирование Predicted строки ---
-                predicted_str_new = "N/A"
-                try:
-                    # --- ИЗМЕНЕННАЯ ЛОГИКА ---
-                    # Получаем оригинальный вопрос из батча (уже извлечен выше как first_q)
-                    # Токенизируем оригинальный вопрос, чтобы получить правильные ID для предсказания
-                    question_token_ids = tokenizer_utils.encode(first_q) # add_special_tokens=False по умолчанию
-
-                    # Добавляем токен '\n' (или его ID), так как модель ожидает его в конце вопроса
-                    # (согласно логике process_batch_for_math_mp, где s = f"{q_clean}\n{a_clean}")
-                    # newline_token_id = tokenizer_utils.encode('\n')[0] # Получаем ID новой строки
-                    # question_token_ids.append(newline_token_id) # Добавляем его
-
-                    # Найти первый целевой токен (не IGNORE_INDEX) из labels
-                    labels_list = labels[0].cpu().tolist()
-                    true_first_a_token_id = config.IGNORE_INDEX
-                    label_start_index = len(question_token_ids) # Индекс, с которого начинаются метки ответа
-                    if label_start_index < len(labels_list):
-                        for j in range(label_start_index, len(labels_list)):
-                             if labels_list[j] != config.IGNORE_INDEX:
-                                  true_first_a_token_id = labels_list[j]
-                                  break
-
-                    # Secondary forward pass for next token prediction
-                    predicted_first_a_token_id = -1
-                    if question_token_ids: # Убедимся, что список токенов не пуст
-                        with torch.no_grad():
-                            # Создаем тензор из ID вопроса
-                            q_tensor = torch.tensor([question_token_ids], device=device)
-                            # Получаем логиты от модели
-                            logits_q, *_ = model(q_tensor)
-                            # Берем логиты для последнего токена в последовательности вопроса
-                            next_logits = logits_q[:, -1, :]
-                            # --- НОВОЕ: Получаем вероятности ---
-                            # Используем полное имя вместо псевдонима F
-                            probabilities = torch.nn.functional.softmax(next_logits, dim=-1)
-                            # Находим ID токена с максимальным логитом (предсказанный)
-                            predicted_first_a_token_id = torch.argmax(probabilities, dim=-1).item()
-                            # --- НОВОЕ: Получаем уверенность (вероятность) предсказанного токена ---
-                            confidence = probabilities[0, predicted_first_a_token_id].item() * 100
-                    else:
-                         print(f"[DIAG Worker {current_process().pid}] Warning: question_token_ids is empty for debug prediction.")
-                         confidence = 0.0 # Устанавливаем уверенность в 0, если не было предсказания
-
-
-                    # Decode predicted token using tokenizer_utils
-                    pred_token_str = repr(tokenizer_utils.decode([predicted_first_a_token_id])) if predicted_first_a_token_id != -1 else "N/A"
-                    # true_token_str не нужен для нового формата вывода
-
-                    # Determine correctness mark with confidence
-                    correctness_mark = ""
-                    # Используем :.2f для форматирования уверенности с двумя знаками после запятой
-                    if predicted_first_a_token_id != -1 and true_first_a_token_id != config.IGNORE_INDEX:
-                        if predicted_first_a_token_id == true_first_a_token_id:
-                            correctness_mark = f" [Correct, conf {confidence:.2f}%]"
-                        else:
-                            correctness_mark = f" [Wrong, conf {confidence:.2f}%]"
-                    elif predicted_first_a_token_id == -1:
-                        correctness_mark = " [PRED FAILED]"
-                    elif true_first_a_token_id == config.IGNORE_INDEX:
-                         # Если истинный токен N/A (Stage 1), просто показываем предсказание и уверенность
-                         correctness_mark = f" [True N/A, conf {confidence:.2f}%]"
-
-                    # Format the final debug string
-                    predicted_str_new = f"Predict#1: {first_q} -> {pred_token_str}{correctness_mark}"
-
-                except Exception as e:
-                    # Логируем ошибку с трассировкой для лучшей диагностики
+                except Exception as e_debug_new:
+                    console.print(f"[Warning] Error during new debug info generation: {e_debug_new}")
                     import traceback
-                    print(f"[ERROR] Failed to generate debug prediction string: {e}")
-                    print(traceback.format_exc())
-                    predicted_str_new = f"Predict#1: N/A (error: {e})"
-                # --- КОНЕЦ: Формирование Predicted строки ---
-
-                # Debug printout (every 20 batches or if anomaly)
-                if i % 20 == 0 or nan_inf_found or zero_grad_found:
-                    console.print(f"--- Batch {i+1} Debug Info ---")
-                    # Print collected limit messages
-                    for msg in limit_messages:
-                        console.print(f"  [yellow]{msg}[/yellow]")
-                    limit_messages = [] # Clear the list after printing
-                    console.print(f"  Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%")
-                    console.print(f"  Aux Var Loss: {aux_variance_loss.item():.4f}")
-                    console.print(f"  Aux LB Loss: {aux_load_balancing_loss.item():.4f}")
-                    path_display = path_str[:100] + ('...' if len(path_str) > 100 else '')
-                    console.print(f"  Path: {path_display}")
-                    console.print(f"  Q (Batch[0]): {first_q}")
-                    console.print(f"  A (Batch[0]): {first_a}")
-                    console.print(f"  {predicted_str_new}")
-                    # --- Новая строка: уверенность в правильном токене ---
-                    try:
-                        if 'pred_pos' in locals() and 'target_id' in locals():
-                            # logits: [batch, seq, vocab], берем [0, pred_pos, :]
-                            import torch.nn.functional as F
-                            true_logits = logits[0, pred_pos, :]
-                            probs = F.softmax(true_logits, dim=-1)
-                            prob_true = probs[target_id].item()
-                            console.print(f"  Model confidence in TRUE token: {prob_true*100:.2f}%")
-                    except Exception as e:
-                        console.print(f"  [yellow]Could not compute confidence: {e}[/yellow]")
-                    console.print("-" * 25)
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                    console.print(traceback.format_exc())
+            # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
             # --- Отправка данных о пути в Redis ---
             if redis_client: # Отправляем только если есть соединение

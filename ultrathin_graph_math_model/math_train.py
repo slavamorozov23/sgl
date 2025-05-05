@@ -33,12 +33,13 @@ console = Console()
 
 class MathDataset(Dataset):
     """Handles loading, processing, caching, and sampling for the math dataset. Uses tokenizer_utils."""
-    # def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".math_dataset_cache", stage1_mode=False): # Убираем tokenizer из аргументов
-    def __init__(self, max_seq_len, split='train', cache_dir=".math_dataset_cache", stage1_mode=False):
+    # def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".math_dataset_cache"): # Removed stage1_mode
+    def __init__(self, max_seq_len, split='train', cache_dir=".math_dataset_cache"): # Removed stage1_mode
         # self.tokenizer = tokenizer # Больше не храним экземпляр здесь
         self.max_seq_len = max_seq_len
         self.ignore_index = config.IGNORE_INDEX
-        self.stage1_mode = stage1_mode
+        # self.stage1_mode = stage1_mode # Removed stage1_mode
+        self.examples = [] # Инициализируем examples пустым списком сразу
         os.makedirs(cache_dir, exist_ok=True)
         # Используем функцию из tokenizer_utils для получения безопасного имени
         safe_tokenizer_name = tokenizer_utils.get_safe_tokenizer_name()
@@ -175,6 +176,7 @@ class MathDataset(Dataset):
                 # --- ДОБАВИТЬ ЛОГ ПОСЛЕ СОЗДАНИЯ ТЕСТОВОГО ПУЛА ---
                 console.log("[DIAG] Test ProcessPoolExecutor created. Submitting test batch...")
                 temp_batch = {'question': raw_questions[:chunk_size], 'answer': raw_answers[:chunk_size]}
+                # Call process_batch_for_math_mp without stage1_mode
                 temp_future = test_executor.submit(process_batch_for_math_mp, temp_batch)
                 temp_result, _ = temp_future.result()
                 # --- ДОБАВИТЬ ЛОГ ПОСЛЕ ПОЛУЧЕНИЯ РЕЗУЛЬТАТА ТЕСТА ---
@@ -197,6 +199,7 @@ class MathDataset(Dataset):
                 console.log(f"[DIAG] Main ProcessPoolExecutor created with {num_workers} workers. Submitting tasks...")
                 for i in range(0, total_items, chunk_size):
                     batch = {'question': raw_questions[i:i+chunk_size], 'answer': raw_answers[i:i+chunk_size]}
+                    # Call process_batch_for_math_mp without stage1_mode
                     futures.append(executor.submit(process_batch_for_math_mp, batch))
                 # --- ДОБАВИТЬ ЛОГ ПОСЛЕ ОТПРАВКИ ЗАДАЧ ---
                 console.log("[DIAG] All tasks submitted. Starting HDF5 cache creation and result processing...")
@@ -342,21 +345,24 @@ class MathDataset(Dataset):
             return
 
         pct = config.DATASET_PERCENTAGE
-        frac = max(0.001, min(1.0, pct / 100.0))
+        # Calculate fraction, ensuring it's between 0 and 1, without the artificial 0.001 minimum
+        frac = max(0.0, min(1.0, pct / 100.0)) # Use max(0.0, ...) to prevent negative fractions if pct is somehow negative
         all_indices = list(range(total))
 
         if frac < 1.0:
             num_to_keep = max(1, int(total * frac))
             self.examples = random.sample(all_indices, num_to_keep) # Сэмплируем индексы
-            console.log(f"Sampled {pct}% ({len(self.examples)}/{total}) indices for the current epoch.")
+            # Calculate the actual percentage sampled for logging
+            actual_sampled_pct = (len(self.examples) / total) * 100 if total > 0 else 0
+            # Log the actual percentage, not the config value, formatted to 3 decimal places
+            console.log(f"Sampled {actual_sampled_pct:.3f}% ({len(self.examples)}/{total}) indices for the current epoch. (Config target: {pct}%)")
         else:
             self.examples = all_indices # Используем все индексы
             console.log(f"Using all {total} indices for the current epoch (100%).")
 
         self.was_sampled = (frac < 1.0)
 
-    def set_stage1_mode(self, mode: bool):
-        self.stage1_mode = mode
+    # Removed set_stage1_mode method
 
     def __len__(self):
         # Возвращает количество сэмплированных индексов
@@ -418,9 +424,43 @@ def evaluate(model, dataloader, crit, device):
                         console.print(f"[yellow]Warning: NaN/Inf loss during evaluation batch. Skipping batch loss.[/yellow]")
 
                     preds = logits.argmax(dim=-1)
-                    mask = labels != config.IGNORE_INDEX
-                    total_correct_tokens += ((preds == labels) & mask).sum().item()
-                    total_target_tokens += mask.sum().item()
+
+                    # --- START: Conditional Accuracy Calculation ---
+                    if config.TRAIN_ON_LAST_ANSWER_TOKEN_ONLY:
+                        # Get EOS token ID
+                        eos_id = tokenizer_utils.get_eos_token_id()
+                        if eos_id is None:
+                            console.print("[red]Error: EOS token ID not found during evaluation, cannot apply TRAIN_ON_LAST_ANSWER_TOKEN_ONLY logic for accuracy.[/red]")
+                            # Fallback to using original labels for accuracy if EOS is missing
+                            current_labels_for_acc = labels
+                        else:
+                            # Create a mask filled with ignore_index
+                            masked_labels_for_acc = torch.full_like(labels, config.IGNORE_INDEX)
+                            # Iterate over each sequence in the batch
+                            for b_idx in range(labels.size(0)):
+                                # Find indices of all EOS tokens
+                                eos_indices = (labels[b_idx] == eos_id).nonzero(as_tuple=True)[0]
+                                # If at least one EOS token is found
+                                if eos_indices.numel() > 0:
+                                    # Get the index of the *first* EOS token
+                                    first_eos_idx = eos_indices[0].item()
+                                    # If the EOS token is not the very first token
+                                    if first_eos_idx > 0:
+                                        # The target index is the one right before the first EOS
+                                        target_idx = first_eos_idx - 1
+                                        # Copy the original label value
+                                        masked_labels_for_acc[b_idx, target_idx] = labels[b_idx, target_idx]
+                            current_labels_for_acc = masked_labels_for_acc
+                    else:
+                        # If the flag is False, use the original labels for accuracy
+                        current_labels_for_acc = labels
+
+                    # Calculate accuracy using the potentially masked labels
+                    mask_for_acc = current_labels_for_acc != config.IGNORE_INDEX
+                    total_correct_tokens += ((preds == current_labels_for_acc) & mask_for_acc).sum().item()
+                    total_target_tokens += mask_for_acc.sum().item()
+                    # --- END: Conditional Accuracy Calculation ---
+
                     total_batches += 1
                 except Exception as e:
                     console.print(f"[red]Error during evaluation batch: {e}[/red]")
@@ -479,16 +519,16 @@ if __name__ == "__main__":
         console.log(f"Modular parameters per cube: {modular_params_per_cube / 1_000_000:.2f} M")
 
 
-        # --- Two-stage training flags ---
-        stage1_complete = False
-        stage1_target_accuracy = 0.90
+        # --- Removed Two-stage training flags ---
+        # stage1_complete = False # Removed
+        # stage1_target_accuracy = 0.90 # Removed
 
         console.log("Loading/Processing Training Dataset...")
-        # dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='train', stage1_mode=True) # Убираем tokenizer
-        dataset = MathDataset(config.MAX_SEQ_LEN, split='train', stage1_mode=True)
+        # dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='train') # Removed stage1_mode
+        dataset = MathDataset(config.MAX_SEQ_LEN, split='train') # Removed stage1_mode
         console.log("Loading/Processing Validation Dataset...")
-        # val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test', stage1_mode=True) # Убираем tokenizer
-        val_dataset = MathDataset(config.MAX_SEQ_LEN, split='test', stage1_mode=True)
+        # val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test') # Removed stage1_mode
+        val_dataset = MathDataset(config.MAX_SEQ_LEN, split='test') # Removed stage1_mode
 
         if len(dataset) == 0:
             console.print("[bold red]Training dataset is empty. Exiting.[/]")
@@ -562,11 +602,11 @@ if __name__ == "__main__":
         console.rule("[bold blue]Start Training[/]")
         best_val_loss = float('inf')
         for epoch in range(config.PRETRAIN_EPOCHS):
-            console.rule(f"[bold]Epoch {epoch+1}/{config.PRETRAIN_EPOCHS} {'(Stage 2)' if stage1_complete else '(Stage 1)'}[/]")
+            console.rule(f"[bold]Epoch {epoch+1}/{config.PRETRAIN_EPOCHS}[/]") # Removed stage info
 
-            # --- Switch stage if needed ---
-            dataset.set_stage1_mode(not stage1_complete)
-            val_dataset.set_stage1_mode(not stage1_complete)
+            # --- Removed stage switching logic ---
+            # dataset.set_stage1_mode(not stage1_complete) # Removed
+            # val_dataset.set_stage1_mode(not stage1_complete) # Removed
 
             # Resample training data for the epoch
             dataset.resample()
@@ -591,11 +631,11 @@ if __name__ == "__main__":
                 avg_val_loss, avg_val_acc = evaluate(model, val_dl, crit, config.DEVICE)
                 console.log(f"[Validation] Epoch {epoch+1}: Avg Loss = {avg_val_loss:.4f}, Avg Acc@Target = {avg_val_acc*100:.2f}%", style="bold blue")
 
-                # --- Stage switch logic ---
-                if not stage1_complete and avg_val_acc >= stage1_target_accuracy:
-                    console.print(f"[bold green]Stage 1 complete! Accuracy {avg_val_acc*100:.2f}% >= {stage1_target_accuracy*100}%. Switching to Stage 2.[/]")
-                    stage1_complete = True
-                    # Optionally adjust LR or optimizer here
+                # --- Removed Stage switch logic ---
+                # if not stage1_complete and avg_val_acc >= stage1_target_accuracy: # Removed
+                #     console.print(f"[bold green]Stage 1 complete! Accuracy {avg_val_acc*100:.2f}% >= {stage1_target_accuracy*100}%. Switching to Stage 2.[/]") # Removed
+                #     stage1_complete = True # Removed
+                #     # Optionally adjust LR or optimizer here # Removed
 
                 if avg_val_loss < best_val_loss:
                     console.log(f"[bold green]Validation loss improved ({best_val_loss:.4f} -> {avg_val_loss:.4f}). Saving model...[/]", style="green")
@@ -665,10 +705,10 @@ if __name__ == "__main__":
                             # Для генерации нам нужны ID вопроса как вход (current_input_ids)
                             # Для сравнения нам нужны ID истинного ответа (answer_ids_true)
                             question_ids = initial_ids_approx[:split_idx] # ID только вопроса
-                            answer_ids_true = initial_ids_approx[split_idx:] # ID ответа, НАЧИНАЯ с токенов \n (_._)
+                            answer_ids_true = initial_ids_approx[split_idx:] # ID ответа, НАЧИНАЯ с токенов \n (_)
 
                             # --- ИСПРАВЛЕНО: Вход для генерации - ТОЛЬКО вопрос ---
-                            # Модель сама должна сгенерировать разделитель (\n -> _._), т.к. обучалась на этом
+                            # Модель сама должна сгенерировать разделитель (\n -> _), т.к. обучалась на этом
                             question_ids_for_input = question_ids
                             # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
@@ -702,22 +742,27 @@ if __name__ == "__main__":
                         input_ids_tensor = torch.tensor([initial_ids_approx], dtype=torch.long).to(config.DEVICE)
 
                         with torch.no_grad():
-                            # Проходим по последовательности до предпоследнего токена
-                            # Ограничиваем длину, чтобы избежать слишком длинного вывода
-                            max_pred_steps = min(len(initial_ids_approx) - 1, config.MAX_SEQ_LEN) # Используем MAX_SEQ_LEN как лимит шагов
-                            for j in range(max_pred_steps):
-                                # Ограничиваем входную последовательность для модели
-                                current_input_ids = input_ids_tensor[:, :min(j+1, config.MAX_SEQ_LEN)]
-                                # Убедимся, что индекс j+1 не выходит за пределы initial_ids_approx
-                                if j + 1 >= len(initial_ids_approx):
-                                    console.print(f"[yellow]Warning: Index {j+1} out of bounds for initial_ids_approx (len={len(initial_ids_approx)}). Stopping prediction.[/yellow]")
-                                    break
-                                true_next_token_id = initial_ids_approx[j+1]
+                            # Определяем начальный и конечный индексы для предсказания ТОЛЬКО токенов ответа
+                            start_pred_idx = len(question_ids) # Начинаем предсказывать с первого токена ответа
+                            end_pred_idx = len(initial_ids_approx) # Идем до конца всей последовательности (включая EOS)
+
+                            console.print(f"Starting prediction from index {start_pred_idx} (first answer token) to {end_pred_idx}.")
+
+                            # Цикл по позициям, где должны быть токены ответа
+                            # Start the loop from the token *after* the separator (index start_pred_idx + 1)
+                            for j in range(start_pred_idx + 1, end_pred_idx):
+                                # Контекст для предсказания: Вопрос + Истинные токены ответа до текущей позиции j
+                                # Убедимся, что j не выходит за пределы MAX_SEQ_LEN
+                                current_context_len = min(j, config.MAX_SEQ_LEN)
+                                current_input_ids = input_ids_tensor[:, :current_context_len]
+
+                                # Истинный токен, который должен быть на позиции j
+                                true_next_token_id = initial_ids_approx[j]
 
                                 try:
-                                    # Получаем логиты от модели
+                                    # Получаем логиты от модели на основе текущего контекста
                                     logits, *_ = model(current_input_ids)
-                                    # Логиты для предсказания следующего токена (на последней позиции входа)
+                                    # Логиты для предсказания следующего токена (на последней позиции контекста)
                                     next_token_logits = logits[:, -1, :]
 
                                     # Получаем вероятности и предсказанный токен
@@ -728,9 +773,9 @@ if __name__ == "__main__":
 
                                     # Декодируем для вывода
                                     # Показываем только последние ~30 токенов контекста для читаемости
-                                    context_tokens = initial_ids_approx[max(0, j+1-30):j+1]
+                                    context_tokens = initial_ids_approx[max(0, j-30):j] # Контекст до текущей позиции j
                                     context_str = tokenizer_utils.decode(context_tokens)
-                                    if j+1 > 30:
+                                    if j > 30:
                                         context_str = "..." + context_str # Добавляем многоточие, если контекст урезан
 
                                     predicted_token_str = repr(tokenizer_utils.decode([predicted_next_token_id]))
@@ -741,15 +786,18 @@ if __name__ == "__main__":
                                     result_marker = "[green]Correct[/]" if is_correct else "[red]Incorrect[/]"
 
                                     # Выводим результат
-                                    console.print(f"Step {j+1}: Context: ...'{context_str}'")
+                                    # Adjust answer step calculation since loop starts from start_pred_idx + 1
+                                    answer_step = j - start_pred_idx # Step 1 corresponds to j = start_pred_idx + 1
+                                    console.print(f"Answer Step {answer_step}: Context: ...'{context_str}'")
                                     console.print(f"  -> Predict: {predicted_token_str} (Conf: {confidence:.2f}%) | True: {true_token_str} | {result_marker}")
 
-                                    # Опционально: остановка, если предсказан EOS или достигнут лимит
-                                    if eos_id is not None and predicted_next_token_id == eos_id and j > len(question_ids): # Останавливаемся после EOS, если он не сразу после вопроса
+                                    # Остановка, если предсказан EOS
+                                    if eos_id is not None and predicted_next_token_id == eos_id:
                                          console.print(f"  Predicted EOS. Stopping prediction for this sample.")
                                          break
                                 except Exception as pred_err:
-                                     console.print(f"[red]Error during token prediction step {j+1}: {pred_err}[/red]")
+                                     # Use the calculated answer_step in the error message
+                                     console.print(f"[red]Error during answer token prediction step {answer_step}: {pred_err}[/red]")
                                      console.print(traceback.format_exc())
                                      break # Прерываем цикл для этого примера при ошибке
 

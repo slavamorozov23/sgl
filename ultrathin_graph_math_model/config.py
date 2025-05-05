@@ -13,7 +13,7 @@ VOCAB_SIZE = None
 DIM_FEEDFORWARD = 2048  # FFN hidden size ≈2.5×d_model for extra-small model
 DROPOUT = 0.1
 MAX_SEQ_LEN = 128  # reduced for speed
-MIN_PATH_LENGTH_RATIO = 0.3
+MIN_PATH_LENGTH_RATIO = 1
 MLA_D_C = 256  # Dimension of latent space for KV compression in MLA
 MLA_QUERY_D_C = 768  # Dimension of latent space for query compression (d'_c)
 MLA_DECOUPLED_KEY_DIM = 64  # Dimension for decoupled keys after RoPE (dʰᴿ)
@@ -22,17 +22,18 @@ MLA_COMPRESS_QUERY = True  # Optional query compression in MLA
 # Pre-Training (Parameters for math-train)
 PRETRAIN_BATCH_SIZE = 16  # larger batch for quick convergence
 PRETRAIN_LEARNING_RATE = 1e-3
-PRETRAIN_EPOCHS = 100  # fewer epochs for fast tests
+PRETRAIN_EPOCHS = 2  # fewer epochs for fast tests
 PRETRAIN_LEARNING_DIR = os.path.join(os.path.dirname(__file__), "..", "deepmind_math_arithmetic")
 PRETRAINED_MODEL_SAVE_PATH = "output_models/spatial_graph_math_model.pth"
-WARMUP_STEPS = 500  # Количество шагов (батчей) для линейного разогрева LR
+WARMUP_STEPS = 1  # Количество шагов (батчей) для линейного разогрева LR
 LOG_GRADIENT_CHECKS = False # Включить/выключить логирование проверки градиентов в train.py
 USE_COSINE_ANNEALING = False # Использовать CosineAnnealingLR после warmup? Иначе LR будет постоянным.
-LOG_BATCH_DEBUG_INFO = False # Включить/выключить детальное логирование батча (включая вторичный проход модели) в train.py
+LOG_BATCH_DEBUG_INFO = True # Включить/выключить детальное логирование батча (включая вторичный проход модели) в train.py
 LOG_AVG_LATENCY = False    # Включить/выключить логирование средней задержки FFN/MLA/Gate в train.py
-DATASET_PERCENTAGE = 20 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
+DATASET_PERCENTAGE = 5 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
 IGNORE_INDEX = -100 # Used for masking labels
 
+TRAIN_ON_LAST_ANSWER_TOKEN_ONLY = True # If True, only train to predict the token right before EOS
 # Common / Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -46,8 +47,8 @@ REPETITION_WINDOW = -1    # consider all previous tokens; set >0 to limit window
 # Spatial Graph Specific
 POINTS_JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "points.json")  # Path to graph configuration JSON
 EXIT_TOKEN_INDEX = -1
-ROUTING_SAFETY_LIMIT = 10
-MAX_CUBES_PER_PATH = 3
+ROUTING_SAFETY_LIMIT = 21
+MAX_CUBES_PER_PATH = 1
 ROUTING_TEMPERATURE = 1  # sharper routing distribution
 
 # Weight for the MoE-style Load Balancing auxiliary loss

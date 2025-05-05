@@ -25,7 +25,7 @@ def _initialize_tokenizer():
         return _tokenizer # Уже инициализирован с тем же именем
 
     _tokenizer_name = config.TOKENIZER_NAME
-    console.log(f"Initializing tokenizer: {_tokenizer_name}...")
+    # console.log(f"Initializing tokenizer: {_tokenizer_name}...")
     try:
         _tokenizer = AutoTokenizer.from_pretrained(_tokenizer_name, use_fast=True)
 
@@ -42,7 +42,7 @@ def _initialize_tokenizer():
                 # Важно: После добавления токена может потребоваться model.resize_token_embeddings(len(tokenizer))
                 # Это нужно будет учесть при рефакторинге модели. Пока оставляем так.
 
-        console.log(f"Tokenizer '{_tokenizer_name}' initialized. Vocab size: {_tokenizer.vocab_size}, Pad token ID: {_tokenizer.pad_token_id}")
+        # console.log(f"Tokenizer '{_tokenizer_name}' initialized. Vocab size: {_tokenizer.vocab_size}, Pad token ID: {_tokenizer.pad_token_id}")
 
     except Exception as e:
         console.print(f"[bold red]Error initializing tokenizer '{_tokenizer_name}': {e}[/]")
@@ -86,12 +86,13 @@ def prepare_text_for_encoding(text: str) -> str:
     """Подготавливает текст к кодированию, заменяя пробелы и новые строки при необходимости."""
     # Убедимся, что проверки были выполнены хотя бы раз
     check_space_encoding()
-    check_newline_encoding()
+    # check_newline_encoding() # Больше не нужна проверка для \n, так как всегда заменяем
     # Выполняем замену только если проверка показала, что символ не кодируется
     if not _space_encodes_non_empty:
         text = text.replace(' ', '_')
-    if not _newline_encodes_non_empty:
-        text = text.replace('\n', '_._')
+    # --- ИЗМЕНЕНО: Всегда заменяем \n на _ ---
+    text = text.replace('\n', '_')
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     return text
 
 def get_tokenizer() -> PreTrainedTokenizerFast:

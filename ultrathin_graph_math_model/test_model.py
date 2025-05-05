@@ -37,45 +37,59 @@ def evaluate(model, dataloader, crit, device):
 #                   max_seq_len: int = None,
 #                   device: torch.device = None) -> str:
 def generate_math(model: torch.nn.Module,
-                  prompt: str,
+                  prompt_with_equals: str, # Переименован для ясности
+                  max_new_tokens: int = 50, # Макс. кол-во новых токенов для генерации
                   max_seq_len: int = None,
                   device: torch.device = None) -> str:
+    """
+    Генерирует продолжение последовательности, начиная с prompt_with_equals.
+    Ожидается, что prompt_with_equals уже содержит 'Question='.
+    Возвращает декодированную строку сгенерированных токенов (ответ + eos).
+    """
     model.eval()
     max_seq_len = max_seq_len or config.MAX_SEQ_LEN
     device = device or config.DEVICE
-    # prepare input "q=" (without initial EOS)
-    s = f"{prompt}="
-    # ids = tokenizer.encode(s)
-    prepared_s = tokenizer_utils.prepare_text_for_encoding(s) # Подготовка текста
-    ids = tokenizer_utils.encode(prepared_s) # Используем tokenizer_utils
-    # truncate
-    if len(ids) > max_seq_len:
-        ids = ids[:max_seq_len]
+
+    # Подготовка входных данных
+    prepared_s = tokenizer_utils.prepare_text_for_encoding(prompt_with_equals)
+    ids = tokenizer_utils.encode(prepared_s)
+
+    # Обрезка, если входная строка слишком длинная
+    if len(ids) >= max_seq_len:
+        ids = ids[:max_seq_len-1] # Оставляем место хотя бы для одного нового токена
+
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-    eos_id = tokenizer_utils.get_eos_token_id() # Получаем EOS ID
+    eos_id = tokenizer_utils.get_eos_token_id()
+
+    generated_ids = [] # Храним только сгенерированные ID
+
     with torch.no_grad():
-        for _ in range(max_seq_len - len(ids)):
-            logits, *_ = model(input_ids=input_ids)
-            next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            input_ids = torch.cat((input_ids, next_id), dim=1)
-            # if next_id.item() == tokenizer.eos_token_id:
-            if eos_id is not None and next_id.item() == eos_id: # Проверяем с полученным EOS ID
+        current_input_ids = input_ids
+        for _ in range(max_new_tokens):
+            # Проверяем, не превышена ли максимальная длина последовательности
+            if current_input_ids.size(1) >= max_seq_len:
+                console.print(f"[bold yellow]Warning:[/bold yellow] Reached max_seq_len ({max_seq_len}) during generation.")
                 break
-    output_ids = input_ids[0].cpu().tolist()
-    # extract answer after '='
-    # eq_id = tokenizer.encode("=")[0]
-    prepared_eq = tokenizer_utils.prepare_text_for_encoding("=") # Подготовка текста
-    eq_ids = tokenizer_utils.encode(prepared_eq) # Используем tokenizer_utils
-    if not eq_ids:
-         console.print("[bold red]Error: Could not encode '=' character.[/bold red]")
-         return "" # Возвращаем пустую строку в случае ошибки
-    eq_id = eq_ids[0]
-    if eq_id in output_ids:
-        ans_ids = output_ids[output_ids.index(eq_id)+1:]
-    else:
-        ans_ids = output_ids[len(ids):]
-    # return tokenizer.decode(ans_ids)
-    return tokenizer_utils.decode(ans_ids) # Используем tokenizer_utils
+
+            logits, *_ = model(input_ids=current_input_ids)
+            next_id_tensor = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            next_id = next_id_tensor.item()
+
+            # Добавляем сгенерированный ID в список
+            generated_ids.append(next_id)
+
+            # Обновляем input_ids для следующего шага
+            current_input_ids = torch.cat((current_input_ids, next_id_tensor), dim=1)
+
+            # Проверяем на EOS
+            if eos_id is not None and next_id == eos_id:
+                break
+        else: # Если цикл завершился без break (не сгенерирован EOS)
+             console.print(f"[bold yellow]Warning:[/bold yellow] Reached max_new_tokens ({max_new_tokens}) without generating EOS.")
+
+
+    # Декодируем только сгенерированные токены
+    return tokenizer_utils.decode(generated_ids)
 
 # def generate_math_variants(model, tokenizer, prompt, max_seq_len, device, num_variants):
 def generate_math_variants(model, prompt, max_seq_len, device, num_variants):
@@ -166,10 +180,13 @@ def test_model(args):
 
     # --- Prompt mode ---
     if args.prompt:
-        # out = generate_math(model, tokenizer, args.prompt, config.MAX_SEQ_LEN, config.DEVICE) # generate_math больше не принимает tokenizer
-        out = generate_math(model, args.prompt, config.MAX_SEQ_LEN, config.DEVICE)
+        # В режиме --prompt генерируем ответ, добавляя '='
+        prompt_with_equals = args.prompt + "="
+        # Устанавливаем разумное количество новых токенов для генерации ответа
+        max_new_tokens_prompt = 100
+        out = generate_math(model, prompt_with_equals, max_new_tokens=max_new_tokens_prompt, max_seq_len=config.MAX_SEQ_LEN, device=config.DEVICE)
         console.print(f"Prompt: {args.prompt}")
-        console.print(f"Model answer: {out}")
+        console.print(f"Model answer: {out.strip()}") # Убираем возможные пробелы в начале/конце
         return
 
     # --- Sample N random examples from validation set (default N=3) ---
@@ -235,28 +252,55 @@ def test_model(args):
         ) as progress:
             task = progress.add_task("Generating answer variants", total=num_variants)
             for _ in range(num_variants):
-                # ans = generate_math(model, tokenizer, q, config.MAX_SEQ_LEN, device) # generate_math больше не принимает tokenizer
-                ans = generate_math(model, q, config.MAX_SEQ_LEN, device)
-                # compute probability
-                # ids = torch.tensor([tokenizer.encode(q + "=" + ans)], dtype=torch.long, device=device)
-                prepared_full_input_var = tokenizer_utils.prepare_text_for_encoding(q + "=" + ans) # Подготовка текста
-                ids = torch.tensor([tokenizer_utils.encode(prepared_full_input_var)], dtype=torch.long, device=device) # Используем tokenizer_utils
-                with torch.no_grad():
-                    logits, *_ = model(input_ids=ids)
-                    probs = torch.nn.functional.softmax(logits, dim=-1)
-                    # p = probs[0, -1, tokenizer.encode(ans)[-1]].item()
-                    prepared_ans_var = tokenizer_utils.prepare_text_for_encoding(ans) # Подготовка текста
-                    ans_encoded_var = tokenizer_utils.encode(prepared_ans_var) # Получаем ID последнего токена ответа
-                    if not ans_encoded_var:
-                         console.print(f"[bold yellow]Warning: Could not encode generated answer variant '{ans}' for probability calculation.[/bold yellow]")
-                         p = 0.0
+                # Готовим вход для генерации: вопрос + знак равенства
+                prompt_for_generation = q + "="
+                # Генерируем только ответ (Answer + EOS)
+                # Устанавливаем разумное ограничение на длину ответа, например 50 токенов
+                max_new_tokens_test = 50
+                generated_answer = generate_math(model, prompt_for_generation, max_new_tokens=max_new_tokens_test, max_seq_len=config.MAX_SEQ_LEN, device=device)
+
+                # --- Вычисление вероятности (оставляем как есть, если нужно) ---
+                # Собираем полный ввод: вопрос + '=' + сгенерированный ответ
+                full_generated_sequence = prompt_for_generation + generated_answer
+                prepared_full_input_var = tokenizer_utils.prepare_text_for_encoding(full_generated_sequence)
+                ids = torch.tensor([tokenizer_utils.encode(prepared_full_input_var)], dtype=torch.long, device=device)
+
+                # Получаем ID последнего токена сгенерированного ответа
+                prepared_ans_var = tokenizer_utils.prepare_text_for_encoding(generated_answer)
+                ans_encoded_var = tokenizer_utils.encode(prepared_ans_var)
+
+                p = 0.0 # Вероятность по умолчанию
+                if ans_encoded_var: # Если ответ не пустой и кодируется
+                    # Убедимся, что ids не пустой и имеет достаточную длину
+                    if ids.numel() > 0 and ids.size(1) > 1:
+                         with torch.no_grad():
+                             logits, *_ = model(input_ids=ids)
+                             # Проверяем размерность logits перед вычислением softmax
+                             if logits.numel() > 0 and logits.dim() == 3:
+                                 probs = torch.nn.functional.softmax(logits, dim=-1)
+                                 # Индекс последнего токена в исходной последовательности ids
+                                 last_token_index = ids.size(1) - 1
+                                 # ID последнего токена сгенерированного ответа
+                                 ans_last_token_id = ans_encoded_var[-1]
+                                 # Извлекаем вероятность последнего токена ответа
+                                 # Убедимся, что индекс не выходит за границы
+                                 if last_token_index < probs.size(1) and ans_last_token_id < probs.size(2):
+                                      p = probs[0, last_token_index, ans_last_token_id].item()
+                                 else:
+                                      console.print(f"[bold yellow]Warning:[/bold yellow] Index out of bounds during probability calculation for '{generated_answer}'.")
+                             else:
+                                  console.print(f"[bold yellow]Warning:[/bold yellow] Invalid logits shape for probability calculation: {logits.shape}")
                     else:
-                         ans_last_token_id = ans_encoded_var[-1]
-                         p = probs[0, -1, ans_last_token_id].item()
-                variants.append((ans, p))
+                         console.print(f"[bold yellow]Warning:[/bold yellow] Empty or too short input tensor for probability calculation.")
+
+                else:
+                    console.print(f"[bold yellow]Warning:[/bold yellow] Could not encode generated answer variant '{generated_answer}' for probability calculation.")
+
+                variants.append((generated_answer.strip(), p)) # Сохраняем очищенный ответ
                 progress.update(task, advance=1)
+        # Выводим варианты сгенерированных ответов
         for i, (ans, p) in enumerate(variants, 1):
-            console.log(f"[{i}] '{ans}' ({p*100:.2f}%)")
+            console.log(f"[{i}] Generated: '{ans}' (Prob: {p*100:.2f}%)")
         console.print(f"[green]True answer:[/green] {a_true}")
         console.print("-"*20)
 
