@@ -19,17 +19,21 @@ console = Console()
 class TextDataset(Dataset):
     """
     Dataset class for pre-training (language modeling on raw text).
-    Handles caching of processed data to speed up subsequent loads.
+    Handles caching of processed data to speed up subsequent loads. Uses tokenizer_utils.
     """
-    def __init__(self, file_paths, tokenizer, max_seq_len, cache_dir=".text_dataset_cache"):
-        self.tokenizer = tokenizer
+    # def __init__(self, file_paths, tokenizer, max_seq_len, cache_dir=".text_dataset_cache"): # Убираем tokenizer
+    def __init__(self, file_paths, max_seq_len, cache_dir=".text_dataset_cache"):
+        # self.tokenizer = tokenizer # Больше не храним
         self.max_seq_len = max_seq_len
         self.examples = []
-        has_eos = self.tokenizer.eos_token_id is not None
+        # has_eos = self.tokenizer.eos_token_id is not None
+        eos_id = tokenizer_utils.get_eos_token_id() # Получаем через utils
+        has_eos = eos_id is not None
 
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
-        tokenizer_name_safe = re.sub(r'[\\/*?:"<>|]', '_', tokenizer.name_or_path)
+        # tokenizer_name_safe = re.sub(r'[\\/*?:"<>|]', '_', tokenizer.name_or_path)
+        tokenizer_name_safe = tokenizer_utils.get_safe_tokenizer_name() # Получаем через utils
         self.param_string = f"pretrain_tok_{tokenizer_name_safe}_seq{max_seq_len}"
 
         console.log(f"Processing/Loading pre-training files with cache config: {self.param_string}")
@@ -63,11 +67,13 @@ class TextDataset(Dataset):
 
                 # Clean text using shared function
                 cleaned_text = clean_text(full_text)
-                all_tokens = self.tokenizer.encode(cleaned_text, add_special_tokens=False)
+                # all_tokens = self.tokenizer.encode(cleaned_text, add_special_tokens=False)
+                all_tokens = tokenizer_utils.encode(cleaned_text) # Используем utils, add_special_tokens=False по умолчанию
 
                 # Append EOS token if the tokenizer has one
                 if has_eos:
-                     all_tokens.append(self.tokenizer.eos_token_id)
+                     # all_tokens.append(self.tokenizer.eos_token_id)
+                     all_tokens.append(eos_id) # Используем полученный ID
 
                 # Use a step half the sequence length for overlapping chunks
                 step = self.max_seq_len // 2
@@ -113,30 +119,37 @@ class DialogDataset(Dataset):
     """
     Dataset class for fine-tuning on dialogue data (e.g., DailyDialog).
     Formats turns with special tokens and masks user input in labels.
-    Allows using a percentage of the dataset. Includes optional debugging output.
+    Allows using a percentage of the dataset. Includes optional debugging output. Uses tokenizer_utils.
     """
-    def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".dialog_dataset_cache", debug_limit=0): # Set debug_limit=0 to disable debug prints by default
-        self.tokenizer = tokenizer
+    # def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".dialog_dataset_cache", debug_limit=0): # Убираем tokenizer
+    def __init__(self, max_seq_len, split='train', cache_dir=".dialog_dataset_cache", debug_limit=0):
+        # self.tokenizer = tokenizer # Больше не храним
         self.max_seq_len = max_seq_len
         self.ignore_index = config.IGNORE_INDEX
-        self.user_token = config.USER_TOKEN
+        self.user_token = config.USER_TOKEN # Оставляем строки токенов
         self.assistant_token = config.ASSISTANT_TOKEN
         all_processed_examples = []
         self.debug_limit = debug_limit
 
-        # Ensure special tokens exist in tokenizer
-        try:
-            self.user_token_id = tokenizer.convert_tokens_to_ids(self.user_token)
-            self.assistant_token_id = tokenizer.convert_tokens_to_ids(self.assistant_token)
-            if self.user_token_id == tokenizer.unk_token_id or self.assistant_token_id == tokenizer.unk_token_id:
-                 raise ValueError("Special tokens (<USER>, <ASSISTANT>) not found in tokenizer vocabulary.")
-        except Exception as e:
-             console.print(f"[bold red]Error getting special token IDs: {e}.[/]")
-             raise e
+        # Ensure special tokens exist in tokenizer using tokenizer_utils
+        self.user_token_id = tokenizer_utils.get_user_token_id()
+        self.assistant_token_id = tokenizer_utils.get_assistant_token_id()
+        if self.user_token_id is None or self.assistant_token_id is None:
+             # Сообщения об ошибках уже выводятся в tokenizer_utils
+             raise ValueError("Special tokens (<USER>, <ASSISTANT>) could not be resolved in tokenizer vocabulary.")
 
-        self.eos_token_id = tokenizer.eos_token_id
+        self.eos_token_id = tokenizer_utils.get_eos_token_id()
         if self.eos_token_id is None:
              console.print("[bold yellow]Warning: EOS token ID not found in tokenizer.[/]")
+        # Получаем pad_id для использования в коде ниже
+        self.pad_token_id = tokenizer_utils.get_pad_token_id()
+        if self.pad_token_id is None:
+             # Используем EOS как запасной, если pad отсутствует
+             self.pad_token_id = self.eos_token_id
+             if self.pad_token_id is None:
+                  console.print("[bold red]Error: Tokenizer has neither PAD nor EOS token ID. Padding might fail.[/]")
+                  # Можно установить значение по умолчанию, например 0, или выбросить ошибку
+                  # self.pad_token_id = 0
 
         console.log(f"Loading and processing DailyDialog dataset ({split} split)...")
         try:
@@ -159,8 +172,11 @@ class DialogDataset(Dataset):
                 user_turn = clean_text(dialog_turns[i])
                 assistant_turn = clean_text(dialog_turns[i+1])
 
-                input_str = f"{self.user_token} {user_turn} {self.assistant_token} {assistant_turn}{tokenizer.eos_token}"
-                input_ids_list = tokenizer.encode(input_str, add_special_tokens=False)
+                # Получаем строку EOS токена
+                eos_token_str = tokenizer_utils.get_tokenizer().eos_token or ""
+                input_str = f"{self.user_token} {user_turn} {self.assistant_token} {assistant_turn}{eos_token_str}"
+                # input_ids_list = tokenizer.encode(input_str, add_special_tokens=False)
+                input_ids_list = tokenizer_utils.encode(input_str) # Используем utils, add_special_tokens=False по умолчанию
 
                 original_length = len(input_ids_list)
                 truncated = False
@@ -197,7 +213,8 @@ class DialogDataset(Dataset):
                     # Safeguard against unexpected negative padding length
                     continue
                 if pad_len > 0:
-                    input_ids = F.pad(input_ids, (0, pad_len), value=self.tokenizer.pad_token_id)
+                    # input_ids = F.pad(input_ids, (0, pad_len), value=self.tokenizer.pad_token_id)
+                    input_ids = F.pad(input_ids, (0, pad_len), value=self.pad_token_id) # Используем полученный pad_id
                     labels = F.pad(labels, (0, pad_len), value=self.ignore_index)
                     padded = True
 
@@ -211,10 +228,13 @@ class DialogDataset(Dataset):
                          console.print(f"Input Str (part): {input_str[:200]}...")
                          console.print(f"Input IDs: {input_ids.tolist()}")
                          console.print(f"Labels:    {labels.tolist()}")
-                         decoded_input = tokenizer.decode(input_ids, skip_special_tokens=False)
+                         # decoded_input = tokenizer.decode(input_ids, skip_special_tokens=False)
+                         decoded_input = tokenizer_utils.decode(input_ids.tolist()) # Используем utils, skip_special_tokens=False по умолчанию
                          readable_labels = labels.clone()
-                         readable_labels[readable_labels == self.ignore_index] = tokenizer.pad_token_id
-                         decoded_labels = tokenizer.decode(readable_labels, skip_special_tokens=False)
+                         # readable_labels[readable_labels == self.ignore_index] = tokenizer.pad_token_id
+                         readable_labels[readable_labels == self.ignore_index] = self.pad_token_id # Используем полученный pad_id
+                         # decoded_labels = tokenizer.decode(readable_labels, skip_special_tokens=False)
+                         decoded_labels = tokenizer_utils.decode(readable_labels.tolist()) # Используем utils
                          console.print(f"Decoded Input:\n'''{decoded_input}'''")
                          console.print(f"Decoded Labels (Target):\n'''{decoded_labels}'''")
                          console.print("="*36)

@@ -5,7 +5,8 @@ import traceback
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 import config
-from transformers import AutoTokenizer
+# from transformers import AutoTokenizer # Заменяем
+import tokenizer_utils
 from model import SpatialGraphTransformer
 from datasets import load_dataset
 import random
@@ -30,8 +31,12 @@ def evaluate(model, dataloader, crit, device):
     model.train()
     return total_loss / total_count if total_count > 0 else float('inf')
 
+# def generate_math(model: torch.nn.Module,
+#                   tokenizer, # Убираем аргумент
+#                   prompt: str,
+#                   max_seq_len: int = None,
+#                   device: torch.device = None) -> str:
 def generate_math(model: torch.nn.Module,
-                  tokenizer,
                   prompt: str,
                   max_seq_len: int = None,
                   device: torch.device = None) -> str:
@@ -40,48 +45,73 @@ def generate_math(model: torch.nn.Module,
     device = device or config.DEVICE
     # prepare input "q=" (without initial EOS)
     s = f"{prompt}="
-    ids = tokenizer.encode(s)
+    # ids = tokenizer.encode(s)
+    prepared_s = tokenizer_utils.prepare_text_for_encoding(s) # Подготовка текста
+    ids = tokenizer_utils.encode(prepared_s) # Используем tokenizer_utils
     # truncate
     if len(ids) > max_seq_len:
         ids = ids[:max_seq_len]
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    eos_id = tokenizer_utils.get_eos_token_id() # Получаем EOS ID
     with torch.no_grad():
         for _ in range(max_seq_len - len(ids)):
             logits, *_ = model(input_ids=input_ids)
             next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             input_ids = torch.cat((input_ids, next_id), dim=1)
-            if next_id.item() == tokenizer.eos_token_id:
+            # if next_id.item() == tokenizer.eos_token_id:
+            if eos_id is not None and next_id.item() == eos_id: # Проверяем с полученным EOS ID
                 break
     output_ids = input_ids[0].cpu().tolist()
     # extract answer after '='
-    eq_id = tokenizer.encode("=")[0]
+    # eq_id = tokenizer.encode("=")[0]
+    prepared_eq = tokenizer_utils.prepare_text_for_encoding("=") # Подготовка текста
+    eq_ids = tokenizer_utils.encode(prepared_eq) # Используем tokenizer_utils
+    if not eq_ids:
+         console.print("[bold red]Error: Could not encode '=' character.[/bold red]")
+         return "" # Возвращаем пустую строку в случае ошибки
+    eq_id = eq_ids[0]
     if eq_id in output_ids:
         ans_ids = output_ids[output_ids.index(eq_id)+1:]
     else:
         ans_ids = output_ids[len(ids):]
-    return tokenizer.decode(ans_ids)
+    # return tokenizer.decode(ans_ids)
+    return tokenizer_utils.decode(ans_ids) # Используем tokenizer_utils
 
-def generate_math_variants(model, tokenizer, prompt, max_seq_len, device, num_variants):
+# def generate_math_variants(model, tokenizer, prompt, max_seq_len, device, num_variants):
+def generate_math_variants(model, prompt, max_seq_len, device, num_variants):
     variants = []
     for _ in range(num_variants):
-        ans = generate_math(model, tokenizer, prompt, max_seq_len, device)
+        # ans = generate_math(model, tokenizer, prompt, max_seq_len, device)
+        ans = generate_math(model, prompt, max_seq_len, device) # Вызываем обновленную функцию
         # calculate probability of answer
-        input_ids = torch.tensor([tokenizer.encode(prompt + "=" + ans)], dtype=torch.long, device=device)
+        # input_ids = torch.tensor([tokenizer.encode(prompt + "=" + ans)], dtype=torch.long, device=device)
+        prepared_full_input = tokenizer_utils.prepare_text_for_encoding(prompt + "=" + ans) # Подготовка текста
+        input_ids = torch.tensor([tokenizer_utils.encode(prepared_full_input)], dtype=torch.long, device=device) # Используем tokenizer_utils
         with torch.no_grad():
             logits, *_ = model(input_ids=input_ids)
             probs = torch.nn.functional.softmax(logits, dim=-1)
-            prob = probs[0, -1, tokenizer.encode(ans)[-1]].item()
+            # prob = probs[0, -1, tokenizer.encode(ans)[-1]].item()
+            prepared_ans = tokenizer_utils.prepare_text_for_encoding(ans) # Подготовка текста
+            ans_encoded = tokenizer_utils.encode(prepared_ans) # Получаем ID последнего токена ответа
+            if not ans_encoded:
+                 console.print(f"[bold yellow]Warning: Could not encode generated answer '{ans}' for probability calculation.[/bold yellow]")
+                 prob = 0.0 # Устанавливаем вероятность 0, если ответ не кодируется
+            else:
+                 ans_last_token_id = ans_encoded[-1]
+                 prob = probs[0, -1, ans_last_token_id].item()
         variants.append((ans, prob))
     return variants
 
 def test_model(args):
     console.rule("[bold blue]Testing Math Model[/]")
-    # initialize tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(config.TOKENIZER_NAME, use_fast=True)
-    # ensure pad_token
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    console.log(f"Tokenizer vocab size: {tokenizer.vocab_size}")
+    # initialize tokenizer and model using tokenizer_utils
+    try:
+        tokenizer_utils.get_tokenizer() # Инициализируем и проверяем
+    except Exception as e:
+        console.print(f"[bold red]Failed to initialize tokenizer via tokenizer_utils: {e}[/]")
+        return
+    # Ручная настройка pad_token больше не нужна, это делается в tokenizer_utils
+    console.log(f"Tokenizer vocab size: {tokenizer_utils.get_vocab_size()}")
     device = config.DEVICE
     model_path = config.PRETRAINED_MODEL_SAVE_PATH
     # load checkpoint state and derive model architecture
@@ -119,7 +149,8 @@ def test_model(args):
         from torch.utils.data import DataLoader
         from math_train import MathDataset
         import torch.nn as nn
-        val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test')
+        # val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test') # MathDataset больше не принимает tokenizer
+        val_dataset = MathDataset(config.MAX_SEQ_LEN, split='test')
         val_dl = DataLoader(
             val_dataset,
             batch_size=config.PRETRAIN_BATCH_SIZE,
@@ -135,7 +166,8 @@ def test_model(args):
 
     # --- Prompt mode ---
     if args.prompt:
-        out = generate_math(model, tokenizer, args.prompt, config.MAX_SEQ_LEN, config.DEVICE)
+        # out = generate_math(model, tokenizer, args.prompt, config.MAX_SEQ_LEN, config.DEVICE) # generate_math больше не принимает tokenizer
+        out = generate_math(model, args.prompt, config.MAX_SEQ_LEN, config.DEVICE)
         console.print(f"Prompt: {args.prompt}")
         console.print(f"Model answer: {out}")
         return
@@ -182,11 +214,14 @@ def test_model(args):
             a_true = raw_a.replace('\n', ' ').strip() if isinstance(raw_a, str) else str(raw_a)
         console.print(f"[bold cyan]Question:[/bold cyan] {q}")
         # full input with actual answer and EOS
-        raw_full = q + "=" + a_true + tokenizer.eos_token
+        # raw_full = q + "=" + a_true + tokenizer.eos_token
+        eos_token = tokenizer_utils.get_tokenizer().eos_token # Получаем сам токен EOS
+        raw_full = q + "=" + a_true + (eos_token if eos_token else "") # Добавляем, если он есть
         full_input = repr(raw_full.encode('utf-8'))
         console.print(f"Full Input Tensor (Cleaned): {full_input}")
         # masked input view up to EOS
-        ans_tokens = tokenizer.encode(a_true + tokenizer.eos_token)
+        # ans_tokens = tokenizer.encode(a_true + tokenizer.eos_token)
+        ans_tokens = tokenizer_utils.encode(a_true + (eos_token if eos_token else "")) # Используем tokenizer_utils
         mask_str = "[PREDICT]" * len(ans_tokens)
         masked_input = repr((q + "=").encode('utf-8')) + mask_str
         console.print(f"Masked Input (Model View): {masked_input}")
@@ -200,13 +235,24 @@ def test_model(args):
         ) as progress:
             task = progress.add_task("Generating answer variants", total=num_variants)
             for _ in range(num_variants):
-                ans = generate_math(model, tokenizer, q, config.MAX_SEQ_LEN, device)
+                # ans = generate_math(model, tokenizer, q, config.MAX_SEQ_LEN, device) # generate_math больше не принимает tokenizer
+                ans = generate_math(model, q, config.MAX_SEQ_LEN, device)
                 # compute probability
-                ids = torch.tensor([tokenizer.encode(q + "=" + ans)], dtype=torch.long, device=device)
+                # ids = torch.tensor([tokenizer.encode(q + "=" + ans)], dtype=torch.long, device=device)
+                prepared_full_input_var = tokenizer_utils.prepare_text_for_encoding(q + "=" + ans) # Подготовка текста
+                ids = torch.tensor([tokenizer_utils.encode(prepared_full_input_var)], dtype=torch.long, device=device) # Используем tokenizer_utils
                 with torch.no_grad():
                     logits, *_ = model(input_ids=ids)
                     probs = torch.nn.functional.softmax(logits, dim=-1)
-                    p = probs[0, -1, tokenizer.encode(ans)[-1]].item()
+                    # p = probs[0, -1, tokenizer.encode(ans)[-1]].item()
+                    prepared_ans_var = tokenizer_utils.prepare_text_for_encoding(ans) # Подготовка текста
+                    ans_encoded_var = tokenizer_utils.encode(prepared_ans_var) # Получаем ID последнего токена ответа
+                    if not ans_encoded_var:
+                         console.print(f"[bold yellow]Warning: Could not encode generated answer variant '{ans}' for probability calculation.[/bold yellow]")
+                         p = 0.0
+                    else:
+                         ans_last_token_id = ans_encoded_var[-1]
+                         p = probs[0, -1, ans_last_token_id].item()
                 variants.append((ans, p))
                 progress.update(task, advance=1)
         for i, (ans, p) in enumerate(variants, 1):

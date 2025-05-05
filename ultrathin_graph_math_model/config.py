@@ -3,7 +3,7 @@ import os
 import numpy as np
 
 # Architecture
-TOKENIZER_NAME = "gpt2" # t5-base для математики, bert-base-uncased легковесный общего назначения, AnReu/math_albert лучший
+TOKENIZER_NAME = "t5-base" # t5-base для математики, bert-base-uncased легковесный общего назначения, AnReu/math_albert лучший
 NHEAD = 8
 HEAD_DIM = 64  # размер одной головы (dₕ)
 D_MODEL = NHEAD * HEAD_DIM  # общее скрытое пространство (~800)
@@ -21,12 +21,16 @@ MLA_COMPRESS_QUERY = True  # Optional query compression in MLA
 
 # Pre-Training (Parameters for math-train)
 PRETRAIN_BATCH_SIZE = 16  # larger batch for quick convergence
-PRETRAIN_LEARNING_RATE = 5e-5
-PRETRAIN_EPOCHS = 8  # fewer epochs for fast tests
+PRETRAIN_LEARNING_RATE = 1e-3
+PRETRAIN_EPOCHS = 100  # fewer epochs for fast tests
 PRETRAIN_LEARNING_DIR = os.path.join(os.path.dirname(__file__), "..", "deepmind_math_arithmetic")
 PRETRAINED_MODEL_SAVE_PATH = "output_models/spatial_graph_math_model.pth"
 WARMUP_STEPS = 500  # Количество шагов (батчей) для линейного разогрева LR
-DATASET_PERCENTAGE = 1 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
+LOG_GRADIENT_CHECKS = False # Включить/выключить логирование проверки градиентов в train.py
+USE_COSINE_ANNEALING = False # Использовать CosineAnnealingLR после warmup? Иначе LR будет постоянным.
+LOG_BATCH_DEBUG_INFO = False # Включить/выключить детальное логирование батча (включая вторичный проход модели) в train.py
+LOG_AVG_LATENCY = False    # Включить/выключить логирование средней задержки FFN/MLA/Gate в train.py
+DATASET_PERCENTAGE = 20 # 5%, или 100000 примеров, будет лучшим значением, дял поулчения хорошей модели
 IGNORE_INDEX = -100 # Used for masking labels
 
 # Common / Device

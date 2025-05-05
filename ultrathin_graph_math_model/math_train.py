@@ -19,8 +19,9 @@ import sys
 from typing import List, Tuple, Set
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
-from transformers import AutoTokenizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR # Import scheduler
+# from transformers import AutoTokenizer # Заменяем на tokenizer_utils
+import tokenizer_utils
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, ConstantLR # Import schedulers
 
 import config
 from model import SpatialGraphTransformer
@@ -31,27 +32,54 @@ from text_utils import clean_text
 console = Console()
 
 class MathDataset(Dataset):
-    """Handles loading, processing, caching, and sampling for the math dataset."""
-    def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".math_dataset_cache", stage1_mode=False):
-        self.tokenizer = tokenizer
+    """Handles loading, processing, caching, and sampling for the math dataset. Uses tokenizer_utils."""
+    # def __init__(self, tokenizer, max_seq_len, split='train', cache_dir=".math_dataset_cache", stage1_mode=False): # Убираем tokenizer из аргументов
+    def __init__(self, max_seq_len, split='train', cache_dir=".math_dataset_cache", stage1_mode=False):
+        # self.tokenizer = tokenizer # Больше не храним экземпляр здесь
         self.max_seq_len = max_seq_len
         self.ignore_index = config.IGNORE_INDEX
         self.stage1_mode = stage1_mode
         os.makedirs(cache_dir, exist_ok=True)
-        safe_tokenizer_name = re.sub(r'[\\/*?:"<>|]', '_', tokenizer.name_or_path)
-        fname = f"math_{split}_add_sub_tok_{safe_tokenizer_name}_seq{max_seq_len}_v3_nonl.h5"
-        self.cache_path = os.path.join(cache_dir, fname)
+        # Используем функцию из tokenizer_utils для получения безопасного имени
+        safe_tokenizer_name = tokenizer_utils.get_safe_tokenizer_name()
+        h5_fname = f"math_{split}_add_sub_tok_{safe_tokenizer_name}_seq{max_seq_len}_v3_nonl.h5"
+        pt_fname = f"math_{split}_add_sub_tok_{safe_tokenizer_name}_seq{max_seq_len}_v3_nonl_stacked_tensor_cache.pt" # Новое имя для кэша со стакнутыми тензорами
+        self.h5_cache_path = os.path.join(cache_dir, h5_fname)
+        self.pt_cache_path = os.path.join(cache_dir, pt_fname) # Путь к тензорному кэшу
 
-        self._all_examples = []
-        self._original_raw_examples = [] # Store original raw data
+        self.all_data = None # Будет содержать словарь с большими тензорами/списками
+        # self._original_raw_examples = [] # Больше не нужно
         load_cache = False
+        loaded_from_pt = False # Флаг, что загрузились из .pt кэша
 
-        if os.path.exists(self.cache_path):
-            console.log(f"Found HDF5 cache (v3_nonl format) at {self.cache_path}, loading examples…")
+        # 1. Проверяем наличие тензорного кэша (.pt)
+        if os.path.exists(self.pt_cache_path):
+            console.log(f"Found PyTorch tensor cache at {self.pt_cache_path}, loading examples directly...")
             try:
-                with h5py.File(self.cache_path, 'r') as hf:
+                start_time = time.time()
+                # Загружаем словарь с большими тензорами/списками
+                self.all_data = torch.load(self.pt_cache_path)
+                end_time = time.time()
+                # Проверяем, что загрузился словарь с нужными ключами
+                if not isinstance(self.all_data, dict) or not all(k in self.all_data for k in ['input_ids', 'labels', 'original_q', 'original_a']):
+                    raise ValueError("Loaded .pt cache has incorrect format. Expected a dict with keys 'input_ids', 'labels', 'original_q', 'original_a'.")
+                num_examples = self.all_data['input_ids'].shape[0]
+                console.log(f"Loaded {num_examples} examples from optimized tensor cache in {end_time - start_time:.2f} seconds.")
+                load_cache = True
+                loaded_from_pt = True
+            except Exception as e:
+                console.print(f"[red]Error loading optimized tensor cache file {self.pt_cache_path}: {e}. Trying HDF5 cache...[/red]")
+                self.all_data = None
+                load_cache = False
+                loaded_from_pt = False
+
+        # 2. Если не загрузились из .pt, проверяем HDF5 кэш (.h5)
+        if not loaded_from_pt and os.path.exists(self.h5_cache_path):
+            console.log(f"Found HDF5 cache (v3_nonl format) at {self.h5_cache_path}, loading examples…")
+            try:
+                with h5py.File(self.h5_cache_path, 'r') as hf:
                     if 'input_ids' not in hf or 'labels' not in hf:
-                         raise ValueError("Cache file missing required datasets.")
+                         raise ValueError("HDF5 Cache file missing required datasets.")
                     ids_ds = hf['input_ids']
                     labels_ds = hf['labels']
                     originals_q_ds = hf.get('original_q', None)
@@ -77,29 +105,58 @@ class MathDataset(Dataset):
                                 "input_ids": torch.tensor(ids_np[i], dtype=torch.long),
                                 "labels": torch.tensor(labels_np[i], dtype=torch.long),
                                 "original_q": originals_q_np[i],
-                                "original_a": originals_a_np[i]
+                                "original_a": originals_a_np[i] # Пока оставляем байты, декодируем позже
                             })
                             progress.update(task, advance=1)
-                    self._all_examples = loaded_examples
-                console.log(f"Loaded {len(self._all_examples)} examples from cache.")
-                load_cache = True
+                    # self._all_examples = loaded_examples # Больше не храним список словарей
+
+                    # --- ПРЕОБРАЗОВАНИЕ В СТАКНУТЫЕ ТЕНЗОРЫ И СПИСКИ ---
+                    if loaded_examples:
+                        console.log("Stacking loaded examples into large tensors/lists...")
+                        try:
+                            stacked_data = {
+                                'input_ids': torch.stack([ex['input_ids'] for ex in loaded_examples]),
+                                'labels': torch.stack([ex['labels'] for ex in loaded_examples]),
+                                # Декодируем строки здесь один раз
+                                'original_q': [ex['original_q'].decode('utf-8', errors='ignore') if isinstance(ex['original_q'], bytes) else str(ex['original_q']) for ex in loaded_examples],
+                                'original_a': [ex['original_a'].decode('utf-8', errors='ignore') if isinstance(ex['original_a'], bytes) else str(ex['original_a']) for ex in loaded_examples]
+                            }
+                            self.all_data = stacked_data
+                            console.log(f"Stacked {self.all_data['input_ids'].shape[0]} examples.")
+
+                            # --- СОХРАНЕНИЕ ОПТИМИЗИРОВАННОГО КЭША ---
+                            console.log(f"Saving stacked data to optimized PyTorch tensor cache at {self.pt_cache_path}...")
+                            start_time = time.time()
+                            torch.save(self.all_data, self.pt_cache_path)
+                            end_time = time.time()
+                            console.log(f"Optimized tensor cache saved successfully in {end_time - start_time:.2f} seconds.")
+                            # --- КОНЕЦ СОХРАНЕНИЯ ---
+                        except Exception as stack_err:
+                            console.print(f"[red]Error stacking data or saving optimized cache: {stack_err}[/red]")
+                            self.all_data = None # Сбрасываем, если была ошибка
+                    else:
+                            console.print("[yellow]No examples loaded from HDF5 cache.[/yellow]")
+                            self.all_data = None
+                    # --- КОНЕЦ ПРЕОБРАЗОВАНИЯ ---
+
+                load_cache = True # Устанавливаем флаг, что загрузка из кэша (HDF5) произошла
             except Exception as e:
-                console.print(f"[red]Error loading cache file {self.cache_path}: {e}. Reprocessing needed.[/red]")
-                self._all_examples = []
+                console.print(f"[red]Error loading HDF5 cache file {self.h5_cache_path}: {e}. Reprocessing needed.[/red]")
+                self.all_data = None
                 load_cache = False
 
-
+        # 3. Если не загрузились ни из .pt, ни из .h5, выполняем полную обработку
         if not load_cache:
-            console.log(f"Processing math dataset split='{split}' for cache (v3_nonl format)...")
+            console.log(f"No valid cache found. Processing math dataset split='{split}' for cache (v3_nonl format)...")
             raw = None
-            with console.status("Loading raw math dataset...", spinner="dots"):
-                try:
-                    raw = load_dataset("math_dataset", "arithmetic__mul", split=split, cache_dir=config.PRETRAIN_LEARNING_DIR, trust_remote_code=True)
-                    console.log(f"Raw dataset '{split}' split loaded with {len(raw)} examples.")
-                except Exception as e:
-                    console.print(f"[bold red]Failed to load raw dataset: {e}[/]")
-                    self.examples = []
-                    return
+            try:
+                # Removed console.status context manager
+                raw = load_dataset("math_dataset", "arithmetic__add_sub_multiple", split=split, cache_dir=config.PRETRAIN_LEARNING_DIR, trust_remote_code=True)
+                console.log(f"Raw dataset '{split}' split loaded with {len(raw)} examples.")
+            except Exception as e:
+                console.print(f"[bold red]Failed to load raw dataset: {e}[/]")
+                self.examples = []
+                return
 
             console.log("Mapping and preprocessing math dataset using ProcessPoolExecutor (incremental HDF5 cache)...")
             raw_questions = raw['question']
@@ -111,10 +168,17 @@ class MathDataset(Dataset):
 
             # Определяем shape данных через маленький тестовый батч
             console.log("Processing a small batch to determine data shapes for HDF5...")
-            with ProcessPoolExecutor(max_workers=1, initializer=init_math_worker, initargs=(tokenizer, max_seq_len, self.ignore_index)) as test_executor:
+            # init_math_worker больше не принимает токенизатор, он получит его сам через tokenizer_utils
+            # --- ДОБАВИТЬ ЛОГ ПЕРЕД СОЗДАНИЕМ ТЕСТОВОГО ПУЛА ---
+            console.log("[DIAG] Creating test ProcessPoolExecutor...")
+            with ProcessPoolExecutor(max_workers=1, initializer=init_math_worker, initargs=(None, max_seq_len, self.ignore_index)) as test_executor:
+                # --- ДОБАВИТЬ ЛОГ ПОСЛЕ СОЗДАНИЯ ТЕСТОВОГО ПУЛА ---
+                console.log("[DIAG] Test ProcessPoolExecutor created. Submitting test batch...")
                 temp_batch = {'question': raw_questions[:chunk_size], 'answer': raw_answers[:chunk_size]}
                 temp_future = test_executor.submit(process_batch_for_math_mp, temp_batch)
                 temp_result, _ = temp_future.result()
+                # --- ДОБАВИТЬ ЛОГ ПОСЛЕ ПОЛУЧЕНИЯ РЕЗУЛЬТАТА ТЕСТА ---
+                console.log("[DIAG] Test batch result received.")
                 if not temp_result or not temp_result.get('input_ids'):
                      console.print("[bold red]Failed to process even a small batch. Cannot determine HDF5 shapes. Exiting.[/bold red]")
                      self._all_examples = []
@@ -125,16 +189,23 @@ class MathDataset(Dataset):
 
             # Основная обработка с инкрементальным сохранением
             futures = []
-            with ProcessPoolExecutor(max_workers=num_workers, initializer=init_math_worker, initargs=(tokenizer, max_seq_len, self.ignore_index)) as executor:
+            # init_math_worker больше не принимает токенизатор
+            # --- ДОБАВИТЬ ЛОГ ПЕРЕД СОЗДАНИЕМ ОСНОВНОГО ПУЛА ---
+            console.log("[DIAG] Creating main ProcessPoolExecutor...")
+            with ProcessPoolExecutor(max_workers=num_workers, initializer=init_math_worker, initargs=(None, max_seq_len, self.ignore_index)) as executor:
+                # --- ДОБАВИТЬ ЛОГ ПОСЛЕ СОЗДАНИЯ ОСНОВНОГО ПУЛА ---
+                console.log(f"[DIAG] Main ProcessPoolExecutor created with {num_workers} workers. Submitting tasks...")
                 for i in range(0, total_items, chunk_size):
                     batch = {'question': raw_questions[i:i+chunk_size], 'answer': raw_answers[i:i+chunk_size]}
                     futures.append(executor.submit(process_batch_for_math_mp, batch))
+                # --- ДОБАВИТЬ ЛОГ ПОСЛЕ ОТПРАВКИ ЗАДАЧ ---
+                console.log("[DIAG] All tasks submitted. Starting HDF5 cache creation and result processing...")
 
-                console.log(f"Creating HDF5 cache (v4 incremental format) at {self.cache_path} and writing incrementally...")
+                console.log(f"Creating HDF5 cache (v4 incremental format) at {self.h5_cache_path} and writing incrementally...")
                 current_write_pos = 0
                 processed_count = 0
                 try:
-                    with h5py.File(self.cache_path, 'w', libver='latest') as hf:
+                    with h5py.File(self.h5_cache_path, 'w', libver='latest') as hf:
                         hf.create_dataset('input_ids', shape=(0, *sample_input_shape), maxshape=(None, *sample_input_shape), dtype=np.int64, compression='gzip')
                         hf.create_dataset('labels', shape=(0, *sample_label_shape), maxshape=(None, *sample_label_shape), dtype=np.int64, compression='gzip')
                         hf.create_dataset('original_q', shape=(0,), maxshape=(None,), dtype=h5py.string_dtype('utf-8'), compression='gzip')
@@ -142,6 +213,8 @@ class MathDataset(Dataset):
 
                         with Progress(BarColumn(), TextColumn("[progress.description]{task.description}"), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeRemainingColumn(), TimeElapsedColumn(), console=console, transient=True) as progress:
                             task = progress.add_task(f"Processing and Saving '{split}' dataset", total=total_items)
+                            # --- ДОБАВИТЬ ЛОГ ПЕРЕД ЦИКЛОМ ОБРАБОТКИ РЕЗУЛЬТАТОВ ---
+                            console.log("[DIAG] Starting to process results with Progress bar...")
 
                             for future in concurrent.futures.as_completed(futures):
                                 try:
@@ -176,19 +249,20 @@ class MathDataset(Dataset):
                     console.log(f"Finished processing. Total examples written to HDF5: {current_write_pos}")
                 except Exception as e:
                     console.print(f"[bold red]Critical Error during HDF5 creation/writing: {e}[/bold red]")
-                    if os.path.exists(self.cache_path):
+                    if os.path.exists(self.h5_cache_path):
                         try:
-                            os.remove(self.cache_path)
-                            console.print(f"[yellow]Removed incomplete cache file: {self.cache_path}[/yellow]")
+                            os.remove(self.h5_cache_path)
+                            console.print(f"[yellow]Removed incomplete HDF5 cache file: {self.h5_cache_path}[/yellow]")
                         except Exception as remove_e:
-                            console.print(f"[red]Error removing incomplete cache file: {remove_e}[/red]")
-                    self._all_examples = []
+                            console.print(f"[red]Error removing incomplete HDF5 cache file: {remove_e}[/red]")
+                    # self._all_examples = [] # Больше не используется
+                    self.all_data = None
                     return
 
-            # Загрузка из только что созданного кэша
-            console.log(f"Loading data from the newly created HDF5 cache at {self.cache_path}...")
+            # Загрузка из только что созданного HDF5 кэша (для последующего стакинга и сохранения в .pt)
+            console.log(f"Loading data from the newly created HDF5 cache at {self.h5_cache_path} for stacking...")
             try:
-                with h5py.File(self.cache_path, 'r') as hf:
+                with h5py.File(self.h5_cache_path, 'r') as hf:
                     ids_ds = hf['input_ids']
                     labels_ds = hf['labels']
                     originals_q_ds = hf.get('original_q', None)
@@ -213,20 +287,55 @@ class MathDataset(Dataset):
                                 "input_ids": torch.tensor(ids_np[i], dtype=torch.long),
                                 "labels": torch.tensor(labels_np[i], dtype=torch.long),
                                 "original_q": q_str,
-                                "original_a": a_str
+                                "original_a": a_str # Строки уже декодированы
                             })
                             progress.update(task, advance=1)
-                    self._all_examples = loaded_examples
-                    console.log(f"Loaded {len(self._all_examples)} examples into memory from newly created cache.")
-            except Exception as e:
-                console.print(f"[bold red]Error loading data from newly created cache {self.cache_path}: {e}. Dataset might be empty.[/bold red]")
-                self._all_examples = []
+                    # --- ПРЕОБРАЗОВАНИЕ В СТАКНУТЫЕ ТЕНЗОРЫ И СПИСКИ ---
+                    if loaded_examples:
+                        console.log("Stacking processed examples into large tensors/lists...")
+                        try:
+                            stacked_data = {
+                                'input_ids': torch.stack([ex['input_ids'] for ex in loaded_examples]),
+                                'labels': torch.stack([ex['labels'] for ex in loaded_examples]),
+                                'original_q': [ex['original_q'] for ex in loaded_examples], # Строки уже готовы
+                                'original_a': [ex['original_a'] for ex in loaded_examples]  # Строки уже готовы
+                            }
+                            self.all_data = stacked_data
+                            console.log(f"Stacked {self.all_data['input_ids'].shape[0]} examples.")
 
-        self.resample()
+                            # --- СОХРАНЕНИЕ ОПТИМИЗИРОВАННОГО КЭША ---
+                            console.log(f"Saving stacked data to optimized PyTorch tensor cache at {self.pt_cache_path}...")
+                            start_time = time.time()
+                            torch.save(self.all_data, self.pt_cache_path)
+                            end_time = time.time()
+                            console.log(f"Optimized tensor cache saved successfully in {end_time - start_time:.2f} seconds.")
+                            # --- КОНЕЦ СОХРАНЕНИЯ ---
+                        except Exception as stack_err:
+                            console.print(f"[red]Error stacking data or saving optimized cache: {stack_err}[/red]")
+                            self.all_data = None
+                    else:
+                         console.print("[yellow]No examples loaded from newly created HDF5 cache.[/yellow]")
+                         self.all_data = None
+                    # --- КОНЕЦ ПРЕОБРАЗОВАНИЯ ---
+
+            except Exception as e:
+                console.print(f"[bold red]Error loading data from newly created HDF5 cache {self.h5_cache_path}: {e}. Dataset might be empty.[/bold red]")
+                self.all_data = None
+
+        # Вызываем resample только если данные были успешно загружены или созданы
+        if self.all_data is not None:
+             self.resample()
+        else:
+             console.print("[red]Dataset initialization failed. No examples loaded.[/red]")
 
     def resample(self):
-        """Resamples the dataset based on config.DATASET_PERCENTAGE."""
-        total = len(self._all_examples)
+        """Resamples indices based on config.DATASET_PERCENTAGE."""
+        if self.all_data is None:
+             self.examples = [] # Хранит индексы
+             console.log("[yellow]No data loaded, cannot resample indices.[/yellow]")
+             return
+
+        total = self.all_data['input_ids'].shape[0]
         if total == 0:
             self.examples = []
             console.log("[yellow]No examples available to sample from.[/yellow]")
@@ -234,14 +343,15 @@ class MathDataset(Dataset):
 
         pct = config.DATASET_PERCENTAGE
         frac = max(0.001, min(1.0, pct / 100.0))
+        all_indices = list(range(total))
 
         if frac < 1.0:
             num_to_keep = max(1, int(total * frac))
-            self.examples = random.sample(self._all_examples, num_to_keep)
-            console.log(f"Sampled {pct}% ({len(self.examples)}/{total}) examples for the current epoch.")
+            self.examples = random.sample(all_indices, num_to_keep) # Сэмплируем индексы
+            console.log(f"Sampled {pct}% ({len(self.examples)}/{total}) indices for the current epoch.")
         else:
-            self.examples = list(self._all_examples)
-            console.log(f"Using all {total} examples for the current epoch (100%).")
+            self.examples = all_indices # Используем все индексы
+            console.log(f"Using all {total} indices for the current epoch (100%).")
 
         self.was_sampled = (frac < 1.0)
 
@@ -249,24 +359,28 @@ class MathDataset(Dataset):
         self.stage1_mode = mode
 
     def __len__(self):
+        # Возвращает количество сэмплированных индексов
         return len(self.examples)
 
     def __getitem__(self, idx):
+        # idx - это индекс в списке сэмплированных индексов self.examples
         if not self.examples:
-             raise IndexError("Dataset is empty")
+             raise IndexError("Dataset is not sampled or empty")
         if not 0 <= idx < len(self.examples):
              raise IndexError(f"Index {idx} out of bounds for current sample size {len(self.examples)}")
-        # Переобработка батча на лету с нужным режимом
-        example = self.examples[idx]
-        # Иначе — обработать через process_batch_for_math_mp с нужным stage1_mode
-        batch = {"question": [example["original_q"]], "answer": [example["original_a"]]}
-        out, _ = process_batch_for_math_mp(batch, show_samples=False, stage1_mode=self.stage1_mode)
-        # Вернуть первый (и единственный) пример
+        if self.all_data is None:
+             raise RuntimeError("Dataset not initialized properly, all_data is None.")
+
+        # Получаем реальный индекс из списка сэмплированных
+        real_idx = self.examples[idx]
+
+        # Возвращаем данные по реальному индексу из больших тензоров/списков
+        # Преобразование в тензоры не нужно, они уже тензоры
         return {
-            "input_ids": torch.tensor(out["input_ids"][0], dtype=torch.long),
-            "labels": torch.tensor(out["labels"][0], dtype=torch.long),
-            "original_q": example["original_q"],
-            "original_a": example["original_a"]
+            "input_ids": self.all_data['input_ids'][real_idx],
+            "labels": self.all_data['labels'][real_idx],
+            "original_q": self.all_data['original_q'][real_idx], # Строка
+            "original_a": self.all_data['original_a'][real_idx]  # Строка
         }
 
 
@@ -321,21 +435,23 @@ def evaluate(model, dataloader, crit, device):
 
 if __name__ == "__main__":
     try:
+        script_start_time = time.time() # Запоминаем время старта
         console.rule("[bold blue]Initializing Math Training (v3_nonl Data Format)[/]")
-        tokenizer = AutoTokenizer.from_pretrained(config.TOKENIZER_NAME, use_fast=True)
-        if tokenizer.pad_token_id is None:
-            console.log("[yellow]Tokenizer lacks pad token, using EOS token as pad token.[/yellow]")
-            if tokenizer.eos_token_id is not None:
-                tokenizer.pad_token = tokenizer.eos_token
-                tokenizer.pad_token_id = tokenizer.eos_token_id
-            else:
-                console.print("[bold red]Error: Tokenizer has neither pad_token_id nor eos_token_id. Cannot proceed.[/]")
-                exit(1)
+        # Инициализация токенизатора через tokenizer_utils (вызов get_tokenizer() произойдет при первом использовании)
+        # Просто убедимся, что он инициализируется и получим данные
+        try:
+            tokenizer_utils.get_tokenizer() # Вызовем для инициализации и проверки
+        except Exception as e:
+             console.print(f"[bold red]Failed to initialize tokenizer via tokenizer_utils: {e}[/]")
+             exit(1)
 
-        config.VOCAB_SIZE = tokenizer.vocab_size
-        console.log(f"Tokenizer: {config.TOKENIZER_NAME}, Vocab size: {config.VOCAB_SIZE}")
+        config.VOCAB_SIZE = tokenizer_utils.get_vocab_size()
+        console.log(f"Tokenizer: {tokenizer_utils.get_tokenizer_name()}, Vocab size: {config.VOCAB_SIZE}")
         # Инициализация глобальных переменных для обработки батчей
-        init_math_worker(tokenizer, config.MAX_SEQ_LEN, config.IGNORE_INDEX)
+        # init_math_worker(tokenizer, config.MAX_SEQ_LEN, config.IGNORE_INDEX) # Удаляем, init_math_worker должен сам получать токенизатор
+        # Вместо этого, просто инициализируем worker-ы (если это все еще нужно)
+        # Важно: init_math_worker в dataset_utils.py нужно будет обновить!
+        init_math_worker(None, config.MAX_SEQ_LEN, config.IGNORE_INDEX) # Передаем None вместо токенизатора
 
         model = SpatialGraphTransformer(
             d_model=config.D_MODEL,
@@ -368,9 +484,11 @@ if __name__ == "__main__":
         stage1_target_accuracy = 0.90
 
         console.log("Loading/Processing Training Dataset...")
-        dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='train', stage1_mode=True)
+        # dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='train', stage1_mode=True) # Убираем tokenizer
+        dataset = MathDataset(config.MAX_SEQ_LEN, split='train', stage1_mode=True)
         console.log("Loading/Processing Validation Dataset...")
-        val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test', stage1_mode=True)
+        # val_dataset = MathDataset(tokenizer, config.MAX_SEQ_LEN, split='test', stage1_mode=True) # Убираем tokenizer
+        val_dataset = MathDataset(config.MAX_SEQ_LEN, split='test', stage1_mode=True)
 
         if len(dataset) == 0:
             console.print("[bold red]Training dataset is empty. Exiting.[/]")
@@ -424,11 +542,22 @@ if __name__ == "__main__":
             main_scheduler_steps = max(1, estimated_total_steps - warmup_steps)
 
         scheduler_warmup = LinearLR(optim, start_factor=1e-9, end_factor=1.0, total_iters=warmup_steps)
-        scheduler_main = CosineAnnealingLR(optim, T_max=main_scheduler_steps, eta_min=1e-6)
+
+        if config.USE_COSINE_ANNEALING:
+            console.log(f"           Using CosineAnnealingLR for {main_scheduler_steps} steps after warmup (eta_min={1e-5}).")
+            scheduler_main = CosineAnnealingLR(optim, T_max=main_scheduler_steps, eta_min=1e-5)
+        else:
+            console.log(f"           Using ConstantLR after warmup (Cosine Annealing disabled in config).")
+            # Используем ConstantLR с фактором 1, чтобы LR оставался тем же, что и после warmup
+            scheduler_main = ConstantLR(optim, factor=1.0, total_iters=main_scheduler_steps) # total_iters здесь не так важен, но нужен
+
         scheduler = SequentialLR(optim, schedulers=[scheduler_warmup, scheduler_main], milestones=[warmup_steps])
         # --- КОНЕЦ: Настройка Warmup и Планировщика ---
 
         crit = nn.CrossEntropyLoss(ignore_index=config.IGNORE_INDEX)
+        # Вывод времени перед началом обучения
+        elapsed_init_time = time.time() - script_start_time
+        console.log(f"Initialization and data loading took: {elapsed_init_time:.2f} seconds.")
 
         console.rule("[bold blue]Start Training[/]")
         best_val_loss = float('inf')
@@ -504,50 +633,127 @@ if __name__ == "__main__":
                     console.print(f"\n--- Sample {test_i+1} (Index: {idx}) ---")
                     try:
                         example = dataset[idx]
-                        q_orig = example['original_q']
-                        a_orig_clean = example['original_a']
-                        s_orig = f"{q_orig}\n{a_orig_clean}"
-                        initial_ids_approx = tokenizer.encode(s_orig, add_special_tokens=False)
-                        if tokenizer.eos_token_id is not None and (not initial_ids_approx or initial_ids_approx[-1] != tokenizer.eos_token_id):
-                            initial_ids_approx.append(tokenizer.eos_token_id)
-                        newline_id = tokenizer.encode('\n', add_special_tokens=False)[0]
+                        q_orig_raw = example['original_q']
+                        a_orig_raw = example['original_a']
+                        # --- ДОБАВЛЕНО: Очистка Q и A для вывода/обработки в конце эпохи ---
+                        q_orig = clean_text(q_orig_raw)
+                        a_orig_clean = clean_text(a_orig_raw) # Название переменной оставляем для консистентности
+                        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+                        s_orig = f"{q_orig}\n{a_orig_clean}" # Используем очищенные версии
+                        # initial_ids_approx = tokenizer.encode(s_orig, add_special_tokens=False)
+                        prepared_s_orig = tokenizer_utils.prepare_text_for_encoding(s_orig) # Подготовка текста
+                        initial_ids_approx = tokenizer_utils.encode(prepared_s_orig) # add_special_tokens=False по умолчанию
+                        # if tokenizer.eos_token_id is not None and (not initial_ids_approx or initial_ids_approx[-1] != tokenizer.eos_token_id):
+                        #     initial_ids_approx.append(tokenizer.eos_token_id)
+                        eos_id = tokenizer_utils.get_eos_token_id()
+                        if eos_id is not None and (not initial_ids_approx or initial_ids_approx[-1] != eos_id):
+                             initial_ids_approx.append(eos_id)
+                        # --- ИЗМЕНЕНИЕ: Определяем точку разделения по длине токенизированного вопроса ---
                         try:
-                            split_idx = initial_ids_approx.index(newline_id)
-                            question_ids = initial_ids_approx[:split_idx+1]
-                            answer_ids_true = initial_ids_approx[split_idx+1:]
-                        except ValueError:
-                            console.print("[yellow]Warning: Newline separator not found in reconstructed sequence. Skipping detailed test.[/yellow]")
-                            console.print(f"Reconstructed Sequence (Approx): {tokenizer.decode(initial_ids_approx)}")
+                            # Токенизируем только очищенный вопрос, чтобы получить его длину
+                            prepared_q_orig = tokenizer_utils.prepare_text_for_encoding(q_orig)
+                            q_orig_ids = tokenizer_utils.encode(prepared_q_orig)
+                            split_idx = len(q_orig_ids) # Индекс первого токена ответа = длина вопроса
+
+                            # Проверяем, что индекс не выходит за пределы
+                            if split_idx >= len(initial_ids_approx):
+                                raise ValueError(f"Calculated split index {split_idx} is out of bounds for sequence length {len(initial_ids_approx)}")
+
+                            # Разделяем последовательность
+                            # Вопрос включает все токены до split_idx (не включая сам токен на split_idx, если он есть)
+                            # Ответ начинается с токена на позиции split_idx
+                            # Для генерации нам нужны ID вопроса как вход (current_input_ids)
+                            # Для сравнения нам нужны ID истинного ответа (answer_ids_true)
+                            question_ids = initial_ids_approx[:split_idx] # ID только вопроса
+                            answer_ids_true = initial_ids_approx[split_idx:] # ID ответа, НАЧИНАЯ с токенов \n (_._)
+
+                            # --- ИСПРАВЛЕНО: Вход для генерации - ТОЛЬКО вопрос ---
+                            # Модель сама должна сгенерировать разделитель (\n -> _._), т.к. обучалась на этом
+                            question_ids_for_input = question_ids
+                            # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Error determining question/answer split: {e}. Skipping detailed test.[/yellow]")
+                            console.print(f"Original Question: {q_orig}")
+                            console.print(f"Original Answer: {a_orig_clean}")
+                            console.print(f"Reconstructed Sequence (Approx): {tokenizer_utils.decode(initial_ids_approx)}")
                             continue
+                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+                        # --- УДАЛЕНЫ ДОП. DEBUG PRINTS ---
+
                         if not answer_ids_true:
-                            console.print("[yellow]Warning: No answer tokens found after newline. Skipping detailed test.[/yellow]")
+                            console.print("[yellow]Warning: No answer tokens found after split point. Skipping detailed test.[/yellow]")
                             continue
-                        initial_full_str = tokenizer.decode(initial_ids_approx)
-                        enter_str = tokenizer.decode(question_ids)
-                        console.print(f"Initial: {initial_full_str}")
-                        console.print(f"Enter: {enter_str}")
-                        current_input_ids = torch.tensor([question_ids], device=config.DEVICE)
+                        # initial_full_str = tokenizer.decode(initial_ids_approx)
+                        initial_full_str = tokenizer_utils.decode(initial_ids_approx) # Полная строка для информации
+                        # enter_str = tokenizer.decode(question_ids_for_input) # Строка, подаваемая на вход генерации
+                        enter_str = tokenizer_utils.decode(question_ids_for_input)
+                        console.print(f"Initial Decoded (Q+A): {initial_full_str}")
+                        console.print(f"Input for Generation (Q): {enter_str}") # Изменено для ясности
+
+                        # --- Пошаговое предсказание токенов ---
+                        console.print("--- Token-by-Token Prediction ---")
+                        # Убедимся, что initial_ids_approx не пустой
+                        if not initial_ids_approx:
+                            console.print("[yellow]Warning: Tokenized sequence is empty. Skipping token prediction.[/yellow]")
+                            continue
+
+                        input_ids_tensor = torch.tensor([initial_ids_approx], dtype=torch.long).to(config.DEVICE)
+
                         with torch.no_grad():
-                            for step, true_answer_token_id in enumerate(answer_ids_true):
-                                if current_input_ids.shape[1] >= config.MAX_SEQ_LEN:
-                                    console.print("[yellow]Max sequence length reached during generation.[/yellow]")
+                            # Проходим по последовательности до предпоследнего токена
+                            # Ограничиваем длину, чтобы избежать слишком длинного вывода
+                            max_pred_steps = min(len(initial_ids_approx) - 1, config.MAX_SEQ_LEN) # Используем MAX_SEQ_LEN как лимит шагов
+                            for j in range(max_pred_steps):
+                                # Ограничиваем входную последовательность для модели
+                                current_input_ids = input_ids_tensor[:, :min(j+1, config.MAX_SEQ_LEN)]
+                                # Убедимся, что индекс j+1 не выходит за пределы initial_ids_approx
+                                if j + 1 >= len(initial_ids_approx):
+                                    console.print(f"[yellow]Warning: Index {j+1} out of bounds for initial_ids_approx (len={len(initial_ids_approx)}). Stopping prediction.[/yellow]")
                                     break
-                                logits_step, *_ = model(current_input_ids)
-                                next_token_logits = logits_step[:, -1, :]
-                                predicted_token_id = torch.argmax(next_token_logits, dim=-1).item()
-                                probabilities = F.softmax(next_token_logits, dim=-1)
-                                confidence = probabilities[0, predicted_token_id].item()
-                                confidence_percent = confidence * 100
-                                predicted_token_str = repr(tokenizer.decode([predicted_token_id]))
-                                true_answer_token_str = repr(tokenizer.decode([true_answer_token_id]))
-                                current_sequence_str = tokenizer.decode(current_input_ids[0].cpu().tolist())
-                                result = "Correct" if predicted_token_id == true_answer_token_id else "Incorrect"
-                                console.print(
-                                    f"Predict: {current_sequence_str} "
-                                    f"(predict {predicted_token_str} with {confidence_percent:.1f}% conf, {result})"
-                                )
-                                next_input_token_tensor = torch.tensor([[true_answer_token_id]], device=config.DEVICE)
-                                current_input_ids = torch.cat([current_input_ids, next_input_token_tensor], dim=1)
+                                true_next_token_id = initial_ids_approx[j+1]
+
+                                try:
+                                    # Получаем логиты от модели
+                                    logits, *_ = model(current_input_ids)
+                                    # Логиты для предсказания следующего токена (на последней позиции входа)
+                                    next_token_logits = logits[:, -1, :]
+
+                                    # Получаем вероятности и предсказанный токен
+                                    probabilities = F.softmax(next_token_logits, dim=-1)
+                                    confidence, predicted_next_token_id_tensor = torch.max(probabilities, dim=-1)
+                                    predicted_next_token_id = predicted_next_token_id_tensor.item()
+                                    confidence = confidence.item() * 100
+
+                                    # Декодируем для вывода
+                                    # Показываем только последние ~30 токенов контекста для читаемости
+                                    context_tokens = initial_ids_approx[max(0, j+1-30):j+1]
+                                    context_str = tokenizer_utils.decode(context_tokens)
+                                    if j+1 > 30:
+                                        context_str = "..." + context_str # Добавляем многоточие, если контекст урезан
+
+                                    predicted_token_str = repr(tokenizer_utils.decode([predicted_next_token_id]))
+                                    true_token_str = repr(tokenizer_utils.decode([true_next_token_id]))
+
+                                    # Проверяем корректность
+                                    is_correct = (predicted_next_token_id == true_next_token_id)
+                                    result_marker = "[green]Correct[/]" if is_correct else "[red]Incorrect[/]"
+
+                                    # Выводим результат
+                                    console.print(f"Step {j+1}: Context: ...'{context_str}'")
+                                    console.print(f"  -> Predict: {predicted_token_str} (Conf: {confidence:.2f}%) | True: {true_token_str} | {result_marker}")
+
+                                    # Опционально: остановка, если предсказан EOS или достигнут лимит
+                                    if eos_id is not None and predicted_next_token_id == eos_id and j > len(question_ids): # Останавливаемся после EOS, если он не сразу после вопроса
+                                         console.print(f"  Predicted EOS. Stopping prediction for this sample.")
+                                         break
+                                except Exception as pred_err:
+                                     console.print(f"[red]Error during token prediction step {j+1}: {pred_err}[/red]")
+                                     console.print(traceback.format_exc())
+                                     break # Прерываем цикл для этого примера при ошибке
+
+                        # --- Конец пошагового предсказания ---
                     except Exception as sample_err:
                         console.print(f"[red]Error processing sample {test_i+1} (index {idx}): {sample_err}[/red]")
                         console.print(traceback.format_exc())

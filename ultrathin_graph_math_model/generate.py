@@ -1,6 +1,7 @@
 import torch
 from torch.nn import functional as F
-from transformers import AutoTokenizer
+# from transformers import AutoTokenizer # Заменяем
+import tokenizer_utils
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 from typing import Optional, List, Tuple
@@ -9,8 +10,13 @@ import config
 
 console = Console()
 
+# def generate_text(model: torch.nn.Module,
+#                   tokenizer: AutoTokenizer, # Убираем аргумент
+#                   prompt: str,
+#                   max_new_tokens: int = 50,
+#                   device: str = "cpu",
+#                   max_seq_len: int = 128):
 def generate_text(model: torch.nn.Module,
-                  tokenizer: AutoTokenizer,
                   prompt: str,
                   max_new_tokens: int = 50,
                   device: str = "cpu",
@@ -24,15 +30,21 @@ def generate_text(model: torch.nn.Module,
     model.eval()
 
     formatted_prompt = f"{config.USER_TOKEN} {prompt} {config.ASSISTANT_TOKEN}"
-    user_token_id = tokenizer.convert_tokens_to_ids(config.USER_TOKEN)
+    # user_token_id = tokenizer.convert_tokens_to_ids(config.USER_TOKEN)
+    user_token_id = tokenizer_utils.get_user_token_id() # Используем tokenizer_utils
 
-    prompt_ids = tokenizer.encode(
-        formatted_prompt,
-        return_tensors="pt",
+    # prompt_ids = tokenizer.encode(
+    prepared_formatted_prompt = tokenizer_utils.prepare_text_for_encoding(formatted_prompt) # Подготовка текста
+    prompt_ids = tokenizer_utils.encode( # Используем tokenizer_utils
+        prepared_formatted_prompt,
+        # return_tensors="pt", # encode в tokenizer_utils пока не поддерживает return_tensors, нужно будет доработать или убрать
+        # Пока уберем return_tensors="pt" и обернем результат в tensor позже
         max_length=max_seq_len, # Truncate prompt
         truncation=True,
-        add_special_tokens=False
-    ).to(device)
+        add_special_tokens=False # Это значение по умолчанию в tokenizer_utils.encode
+    )
+    # Оборачиваем в тензор вручную
+    prompt_ids = torch.tensor([prompt_ids], dtype=torch.long).to(device)
 
     if prompt_ids.shape[1] >= max_seq_len:
          console.print(f"[yellow]Warning: Input prompt after formatting and truncation is already at max_seq_len ({prompt_ids.shape[1]}/{max_seq_len}). No room for generation.[/yellow]")
@@ -120,11 +132,13 @@ def generate_text(model: torch.nn.Module,
                 progress.update(task_id, advance=1)
 
                 # Check for stopping conditions (EOS or USER token)
-                if tokenizer.eos_token_id is not None and next_token_id.item() == tokenizer.eos_token_id:
-                    console.log(f"EOS token generated (ID: {tokenizer.eos_token_id}).")
+                eos_id = tokenizer_utils.get_eos_token_id()
+                if eos_id is not None and next_token_id.item() == eos_id:
+                    console.log(f"EOS token generated (ID: {eos_id}).")
                     progress.update(task_id, completed=max_new_tokens)
                     break
-                if next_token_id.item() == user_token_id:
+                # user_token_id уже получен выше
+                if user_token_id is not None and next_token_id.item() == user_token_id:
                      console.log(f"USER token generated (ID: {user_token_id}). Stopping generation.")
                      progress.update(task_id, completed=max_new_tokens)
                      generated_ids = generated_ids[:, :-1] # Remove the generated USER token
@@ -137,7 +151,8 @@ def generate_text(model: torch.nn.Module,
     console.print(f"Final Generated IDs shape: {generated_ids.shape}")
     console.print(f"Final Generated IDs: {generated_ids[0].tolist()}")
     try:
-        raw_decoded_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+        # raw_decoded_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+        raw_decoded_text = tokenizer_utils.decode(generated_ids[0].tolist()) # skip_special_tokens=False по умолчанию
         console.print(f"Raw Decoded Text (before cleaning):\n'''\n{raw_decoded_text}\n'''")
     except Exception as decode_err:
         console.print(f"[bold red]Error during raw decoding for debug: {decode_err}[/]")
@@ -145,7 +160,8 @@ def generate_text(model: torch.nn.Module,
     # --- End Debugging Output ---
 
     # --- Decode and Clean Output ---
-    full_generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+    # full_generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+    full_generated_text = tokenizer_utils.decode(generated_ids[0].tolist()) # skip_special_tokens=False по умолчанию
 
     # Find the start of the assistant's response
     assistant_response_start_index = full_generated_text.rfind(config.ASSISTANT_TOKEN)
@@ -154,20 +170,26 @@ def generate_text(model: torch.nn.Module,
         assistant_response = full_generated_text[assistant_response_start_index + len(config.ASSISTANT_TOKEN):]
     else:
         # Fallback: try to remove the original prompt (less reliable)
-        prompt_decoded_len = len(tokenizer.decode(prompt_ids[0], skip_special_tokens=False))
+        # prompt_decoded_len = len(tokenizer.decode(prompt_ids[0], skip_special_tokens=False))
+        prompt_decoded_len = len(tokenizer_utils.decode(prompt_ids[0].tolist())) # skip_special_tokens=False по умолчанию
         assistant_response = full_generated_text[prompt_decoded_len:]
         console.print("[yellow]Warning: Could not find ASSISTANT_TOKEN in generated text. Output might include parts of the prompt.[/yellow]")
 
 
     # Remove special tokens from the assistant's response
-    if tokenizer.eos_token:
-        assistant_response = assistant_response.replace(tokenizer.eos_token, "")
+    # Получаем сами строки токенов
+    tok_instance = tokenizer_utils.get_tokenizer()
+    eos_token_str = tok_instance.eos_token
+    pad_token_str = tok_instance.pad_token
+
+    if eos_token_str:
+        assistant_response = assistant_response.replace(eos_token_str, "")
     if config.USER_TOKEN:
         # Prevent removing user token if it was legitimately generated within the response
         # This cleanup focuses on removing structural tokens added by the script
         pass # Typically USER token generation stops the process anyway
-    if tokenizer.pad_token:
-         assistant_response = assistant_response.replace(tokenizer.pad_token, "")
+    if pad_token_str:
+         assistant_response = assistant_response.replace(pad_token_str, "")
 
     # Remove leading/trailing whitespace
     assistant_response = assistant_response.strip()

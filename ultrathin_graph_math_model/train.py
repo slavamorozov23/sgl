@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import redis
@@ -17,6 +18,7 @@ from rich.text import Text
 from rich.console import Group
 from torch.optim.lr_scheduler import SequentialLR  # Add scheduler import
 from metrics import metrics # Import metrics collector
+import tokenizer_utils # Импортируем наш модуль
 
 console = Console()
 
@@ -64,7 +66,8 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeRemainingColumn(), TimeElapsedColumn(),
         TextColumn("Loss: {task.fields[loss]:.4f}"),
-        TextColumn("Acc: {task.fields[acc]:.2f}%"),
+        TextColumn("Epoch Acc: {task.fields[acc]:.2f}%"),
+        TextColumn("Batch Acc: {task.fields[batch_acc]:.2f}%")
     ]
     epoch_progress = Progress(*progress_columns, console=console)
     task_id = epoch_progress.add_task(
@@ -72,6 +75,7 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
         total=num_batches if num_batches > 0 else None,
         loss=float('inf'),
         acc=0.0,
+        batch_acc=0.0, # Initialize batch_acc
         path_str="",
         cubes_used=0, num_total_cubes=model.num_cubes
     )
@@ -119,17 +123,20 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
                  console.print(f"[red]Warning: NaN/Inf loss at batch {i}. Skipping update.[/red]")
                  continue
 
-            # Log latency metrics every 10 batches
-            if window_batches >= 10: # Use window_batches counter
-                avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
-                avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
-                avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
-                console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
+            # --- ИЗМЕНЕНО: Условное логирование и сброс счетчиков задержки ---
+            if window_batches >= 10:
+                # Логируем только если флаг включен
+                if config.LOG_AVG_LATENCY:
+                    avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
+                    avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
+                    avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
+                    console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
 
-                # Reset window accumulators
+                # Сбрасываем счетчики всегда, когда условие window_batches >= 10 выполняется
                 window_ffn_time = window_mla_time = window_gate_time = 0.0
                 window_ffn_calls = window_mla_calls = window_gate_calls = 0
                 window_batches = 0
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             # Backward pass and optimization step
             scaler.scale(loss).backward()
@@ -148,27 +155,34 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
                 # Проверка на ненулевой градиент
                 if p.grad.norm().item() > 1e-9:
                     zero_grad_found = False
-            # Логируем результат проверки градиентов
-            if nan_inf_found:
-                console.log(f"[bold red]Batch {i}: NaN/Inf градиенты обнаружены! Шаг оптимизатора будет пропущен.[/bold red]")
-            elif zero_grad_found:
-                console.log(f"[yellow]Batch {i}: Все градиенты нулевые или близкие к нулю. Нет сигнала обучения?[/yellow]")
-            else:
-                # Keep original gradient log
-                if i % 10 == 0:
-                    console.log(f"[green]Batch {i}: Градиенты в норме.[/green]")
 
-            # Log latency metrics every 10 batches
-            if window_batches >= 10: # Use window_batches counter
-                avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
-                avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
-                avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
-                console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
+            # --- ИЗМЕНЕНО: Условное логирование проверки градиентов ---
+            if config.LOG_GRADIENT_CHECKS:
+                if nan_inf_found:
+                    console.log(f"[bold red]Batch {i}: NaN/Inf градиенты обнаружены! Шаг оптимизатора будет пропущен.[/bold red]")
+                elif zero_grad_found:
+                    console.log(f"[yellow]Batch {i}: Все градиенты нулевые или близкие к нулю. Нет сигнала обучения?[/yellow]")
+                else:
+                    # Keep original gradient log
+                    if i % 10 == 0:
+                        console.log(f"[green]Batch {i}: Градиенты в норме.[/green]")
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-                # Reset window accumulators
+            # --- ИЗМЕНЕНО: Условное логирование и сброс счетчиков задержки (второе место) ---
+            # Этот блок кажется дублирующим, но применим ту же логику
+            if window_batches >= 10:
+                # Логируем только если флаг включен
+                if config.LOG_AVG_LATENCY:
+                    avg_ffn_latency = window_ffn_time / window_ffn_calls if window_ffn_calls > 0 else 0.0
+                    avg_mla_latency = window_mla_time / window_mla_calls if window_mla_calls > 0 else 0.0
+                    avg_gate_latency = window_gate_time / window_gate_calls if window_gate_calls > 0 else 0.0
+                    console.log(f"[Batch {i+1}] Avg Latency (last 10 batches): FFN={avg_ffn_latency:.6f}s, MLA={avg_mla_latency:.6f}s, Gate={avg_gate_latency:.6f}s")
+
+                # Сбрасываем счетчики всегда, когда условие window_batches >= 10 выполняется
                 window_ffn_time = window_mla_time = window_gate_time = 0.0
                 window_ffn_calls = window_mla_calls = window_gate_calls = 0
                 window_batches = 0
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             # Условное выполнение шага оптимизатора
             if not nan_inf_found:
@@ -189,14 +203,13 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
             total_loss += loss.item()
             total_cubes_used += cubes_used_count
 
-            # Calculate accuracy at the single target token position
-            batch_correct = 0
-            batch_total = 0
+            # Calculate batch accuracy
             with torch.no_grad():
                 preds = logits.argmax(dim=-1)
                 mask = labels != config.IGNORE_INDEX
                 batch_correct = ((preds == labels) & mask).sum().item()
                 batch_total = mask.sum().item()
+                batch_acc = (batch_correct / batch_total) * 100 if batch_total > 0 else 0.0
 
             total_correct_tokens += batch_correct
             total_target_tokens += batch_total
@@ -213,151 +226,190 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
                 advance=1,
                 loss=avg_loss,
                 acc=avg_acc * 100.0,
+                batch_acc=batch_acc,
                 path_str=path_str,
                 cubes_used=cubes_used_count
             )
 
-            # Prepare dynamic logging text (for first item in batch)
-            try:
-                input_ids_list = input_ids[0].cpu().tolist()
-                labels_list = labels[0].cpu().tolist()
-                tokenizer = dataloader.dataset.tokenizer
-                pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-                ignore_index = config.IGNORE_INDEX
-
-                # Decode display input
-                disp_ids = [t for t in input_ids_list if t != pad_token_id]
-                input_text_display = tokenizer.decode(disp_ids, skip_special_tokens=False).strip()
-
-                # Decode prediction task
-                valid_idxs = [j for j,v in enumerate(labels_list) if v!=ignore_index]
-                if valid_idxs:
-                    pred_pos = valid_idxs[0]
-                    pre_ids = [t for t in input_ids_list[:pred_pos+1] if t!=pad_token_id]
-                    task_context = tokenizer.decode(pre_ids, skip_special_tokens=False).strip()
-                    target_id = labels_list[pred_pos]
-                    target_str = tokenizer.decode([target_id], skip_special_tokens=False)
-                else:
-                    task_context = input_text_display
-                    target_str = ""
-
-                # Reconstruct full question before '='
-                eq = tokenizer.encode("=", add_special_tokens=False)[0]
-                if eq in input_ids_list:
-                    q_tokens = input_ids_list[:input_ids_list.index(eq)]
-                    question = tokenizer.decode(q_tokens, skip_special_tokens=False).strip()
-                else:
-                    question = input_text_display
-            except:
-                input_text_display, task_context, target_str, question = "", "", "", ""
-
-            # --- НАЧАЛО: Код для извлечения Q/A из batch ---
-            first_q = "N/A"
-            first_a = "N/A"
-            try:
-                if isinstance(batch, dict) and \
-                   'original_q' in batch and batch['original_q'] and \
-                   'original_a' in batch and batch['original_a']:
-
-                    q_data = batch['original_q'][0]
-                    a_data = batch['original_a'][0]
-
-                    # Декодируем, если это байты (из HDF5 кэша)
-                    if isinstance(q_data, bytes):
-                        first_q = q_data.decode('utf-8', errors='ignore')
-                    elif isinstance(q_data, str):
-                        first_q = q_data
-                    else:
-                        first_q = str(q_data)
-
-                    if isinstance(a_data, bytes):
-                        first_a = a_data.decode('utf-8', errors='ignore')
-                    elif isinstance(a_data, str):
-                        first_a = a_data
-                    else:
-                        first_a = str(a_data)
-
-                    # Ограничим длину для вывода
-                    first_q = first_q[:80] + "..." if len(first_q) > 80 else first_q
-                    first_a = first_a[:80] + "..." if len(first_a) > 80 else first_a
-            except Exception as e:
-                pass # Оставляем N/A
-            # --- КОНЕЦ: Код для извлечения Q/A из batch ---
-
-            # --- НАЧАЛО: Формирование Predicted строки ---
-            predicted_str_new = "N/A"
-            try:
-                input_ids_list = input_ids[0].cpu().tolist()
-                labels_list = labels[0].cpu().tolist()
-                # Extract question token IDs
+            # --- ИЗМЕНЕНО: Условное выполнение всего блока отладки батча ---
+            if config.LOG_BATCH_DEBUG_INFO:
+                # Prepare dynamic logging text (for first item in batch)
                 try:
-                    newline_token_id = tokenizer.encode('\n', add_special_tokens=False)[0]
-                    newline_idx = input_ids_list.index(newline_token_id)
-                    question_token_ids = input_ids_list[:newline_idx+1]
-                except ValueError:
-                    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-                    if pad_token_id in input_ids_list:
-                        question_token_ids = input_ids_list[:input_ids_list.index(pad_token_id)]
-                    else:
-                        question_token_ids = input_ids_list
-                # Найти первый целевой токен (не IGNORE_INDEX)
-                true_first_a_token_id = config.IGNORE_INDEX
-                for tok in labels_list:
-                    if tok != config.IGNORE_INDEX:
-                        true_first_a_token_id = tok
-                        break
-                # Secondary forward pass for next token
-                predicted_first_a_token_id = -1
-                if question_token_ids:
-                    with torch.no_grad():
-                        q_tensor = torch.tensor([question_token_ids], device=device)
-                        logits_q, *_ = model(q_tensor)
-                        next_logits = logits_q[:, -1, :]
-                        predicted_first_a_token_id = torch.argmax(next_logits, dim=-1).item()
-                # Decode tokens
-                pred_token_str = repr(tokenizer.decode([predicted_first_a_token_id])) if predicted_first_a_token_id != -1 else "N/A"
-                true_token_str = repr(tokenizer.decode([true_first_a_token_id])) if true_first_a_token_id != config.IGNORE_INDEX else "N/A"
-                correctness_mark = ""
-                if predicted_first_a_token_id == true_first_a_token_id and true_first_a_token_id != config.IGNORE_INDEX:
-                    correctness_mark = " [CORRECT]"
-                elif predicted_first_a_token_id != true_first_a_token_id and true_first_a_token_id != config.IGNORE_INDEX and predicted_first_a_token_id != -1:
-                    correctness_mark = f" [WRONG (True: {true_token_str})]"
-                elif predicted_first_a_token_id == -1:
-                    correctness_mark = " [PRED FAILED]"
-                elif true_first_a_token_id == config.IGNORE_INDEX:
-                    correctness_mark = " [TRUE N/A]"
-                predicted_str_new = f"Predict#1: {first_q} -> {pred_token_str}{correctness_mark}"
-            except Exception as e:
-                predicted_str_new = f"Predict#1: N/A (error: {e})"
-            # --- КОНЕЦ: Формирование Predicted строки ---
+                    input_ids_list = input_ids[0].cpu().tolist()
+                    labels_list = labels[0].cpu().tolist()
+                    # tokenizer = dataloader.dataset.tokenizer # Больше не получаем токенизатор так
+                    # Используем tokenizer_utils напрямую
+                    pad_token_id = tokenizer_utils.get_pad_token_id()
+                    eos_token_id = tokenizer_utils.get_eos_token_id()
+                    effective_pad_id = pad_token_id if pad_token_id is not None else eos_token_id # Используем EOS как запасной
+                    ignore_index = config.IGNORE_INDEX
 
-            # Debug printout (every 20 batches or if anomaly)
-            if i % 20 == 0 or nan_inf_found or zero_grad_found:
-                console.print(f"--- Batch {i+1} Debug Info ---")
-                # Print collected limit messages
-                for msg in limit_messages:
-                    console.print(f"  [yellow]{msg}[/yellow]")
-                limit_messages = [] # Clear the list after printing
-                console.print(f"  Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%")
-                console.print(f"  Aux Var Loss: {aux_variance_loss.item():.4f}")
-                console.print(f"  Aux LB Loss: {aux_load_balancing_loss.item():.4f}")
-                path_display = path_str[:100] + ('...' if len(path_str) > 100 else '')
-                console.print(f"  Path: {path_display}")
-                console.print(f"  Q (Batch[0]): {first_q}")
-                console.print(f"  A (Batch[0]): {first_a}")
-                console.print(f"  {predicted_str_new}")
-                # --- Новая строка: уверенность в правильном токене ---
+                    # Decode display input
+                    disp_ids = [t for t in input_ids_list if t != effective_pad_id]
+                    # input_text_display = tokenizer.decode(disp_ids, skip_special_tokens=False).strip()
+                    input_text_display = tokenizer_utils.decode(disp_ids).strip() # skip_special_tokens=False по умолчанию
+
+                    # Decode prediction task
+                    valid_idxs = [j for j,v in enumerate(labels_list) if v!=ignore_index]
+                    if valid_idxs:
+                        pred_pos = valid_idxs[0]
+                        pre_ids = [t for t in input_ids_list[:pred_pos+1] if t!=effective_pad_id]
+                        # task_context = tokenizer.decode(pre_ids, skip_special_tokens=False).strip()
+                        task_context = tokenizer_utils.decode(pre_ids).strip()
+                        target_id = labels_list[pred_pos]
+                        # target_str = tokenizer.decode([target_id], skip_special_tokens=False)
+                        target_str = tokenizer_utils.decode([target_id])
+                    else:
+                        task_context = input_text_display
+                        target_str = ""
+
+                    # Reconstruct full question before '='
+                    # eq = tokenizer.encode("=", add_special_tokens=False)[0]
+                    eq = tokenizer_utils.encode("=")[0] # add_special_tokens=False по умолчанию
+                    if eq in input_ids_list:
+                        q_tokens = input_ids_list[:input_ids_list.index(eq)]
+                        # question = tokenizer.decode(q_tokens, skip_special_tokens=False).strip()
+                        question = tokenizer_utils.decode(q_tokens).strip()
+                    else:
+                        question = input_text_display
+                except Exception as log_err:
+                    input_text_display, task_context, target_str, question = f"Err:{log_err}", "", "", ""
+
+                # --- НАЧАЛО: Код для извлечения Q/A из batch ---
+                first_q = "N/A"
+                first_a = "N/A"
                 try:
-                    if 'pred_pos' in locals() and 'target_id' in locals():
-                        # logits: [batch, seq, vocab], берем [0, pred_pos, :]
-                        import torch.nn.functional as F
-                        true_logits = logits[0, pred_pos, :]
-                        probs = F.softmax(true_logits, dim=-1)
-                        prob_true = probs[target_id].item()
-                        console.print(f"  Model confidence in TRUE token: {prob_true*100:.2f}%")
+                    if isinstance(batch, dict) and \
+                       'original_q' in batch and batch['original_q'] and \
+                       'original_a' in batch and batch['original_a']:
+
+                        q_data = batch['original_q'][0]
+                        a_data = batch['original_a'][0]
+
+                        # Декодируем, если это байты (из HDF5 кэша)
+                        if isinstance(q_data, bytes):
+                            first_q = q_data.decode('utf-8', errors='ignore')
+                        elif isinstance(q_data, str):
+                            first_q = q_data
+                        else:
+                            first_q = str(q_data)
+
+                        if isinstance(a_data, bytes):
+                            first_a = a_data.decode('utf-8', errors='ignore')
+                        elif isinstance(a_data, str):
+                            first_a = a_data
+                        else:
+                            first_a = str(a_data)
+
+                        # Ограничим длину для вывода
+                        first_q = first_q[:80] + "..." if len(first_q) > 80 else first_q
+                        first_a = first_a[:80] + "..." if len(first_a) > 80 else first_a
                 except Exception as e:
-                    console.print(f"  [yellow]Could not compute confidence: {e}[/yellow]")
-                console.print("-" * 25)
+                    pass # Оставляем N/A
+                # --- КОНЕЦ: Код для извлечения Q/A из batch ---
+
+                # --- НАЧАЛО: Формирование Predicted строки ---
+                predicted_str_new = "N/A"
+                try:
+                    # --- ИЗМЕНЕННАЯ ЛОГИКА ---
+                    # Получаем оригинальный вопрос из батча (уже извлечен выше как first_q)
+                    # Токенизируем оригинальный вопрос, чтобы получить правильные ID для предсказания
+                    question_token_ids = tokenizer_utils.encode(first_q) # add_special_tokens=False по умолчанию
+
+                    # Добавляем токен '\n' (или его ID), так как модель ожидает его в конце вопроса
+                    # (согласно логике process_batch_for_math_mp, где s = f"{q_clean}\n{a_clean}")
+                    # newline_token_id = tokenizer_utils.encode('\n')[0] # Получаем ID новой строки
+                    # question_token_ids.append(newline_token_id) # Добавляем его
+
+                    # Найти первый целевой токен (не IGNORE_INDEX) из labels
+                    labels_list = labels[0].cpu().tolist()
+                    true_first_a_token_id = config.IGNORE_INDEX
+                    label_start_index = len(question_token_ids) # Индекс, с которого начинаются метки ответа
+                    if label_start_index < len(labels_list):
+                        for j in range(label_start_index, len(labels_list)):
+                             if labels_list[j] != config.IGNORE_INDEX:
+                                  true_first_a_token_id = labels_list[j]
+                                  break
+
+                    # Secondary forward pass for next token prediction
+                    predicted_first_a_token_id = -1
+                    if question_token_ids: # Убедимся, что список токенов не пуст
+                        with torch.no_grad():
+                            # Создаем тензор из ID вопроса
+                            q_tensor = torch.tensor([question_token_ids], device=device)
+                            # Получаем логиты от модели
+                            logits_q, *_ = model(q_tensor)
+                            # Берем логиты для последнего токена в последовательности вопроса
+                            next_logits = logits_q[:, -1, :]
+                            # --- НОВОЕ: Получаем вероятности ---
+                            # Используем полное имя вместо псевдонима F
+                            probabilities = torch.nn.functional.softmax(next_logits, dim=-1)
+                            # Находим ID токена с максимальным логитом (предсказанный)
+                            predicted_first_a_token_id = torch.argmax(probabilities, dim=-1).item()
+                            # --- НОВОЕ: Получаем уверенность (вероятность) предсказанного токена ---
+                            confidence = probabilities[0, predicted_first_a_token_id].item() * 100
+                    else:
+                         print(f"[DIAG Worker {current_process().pid}] Warning: question_token_ids is empty for debug prediction.")
+                         confidence = 0.0 # Устанавливаем уверенность в 0, если не было предсказания
+
+
+                    # Decode predicted token using tokenizer_utils
+                    pred_token_str = repr(tokenizer_utils.decode([predicted_first_a_token_id])) if predicted_first_a_token_id != -1 else "N/A"
+                    # true_token_str не нужен для нового формата вывода
+
+                    # Determine correctness mark with confidence
+                    correctness_mark = ""
+                    # Используем :.2f для форматирования уверенности с двумя знаками после запятой
+                    if predicted_first_a_token_id != -1 and true_first_a_token_id != config.IGNORE_INDEX:
+                        if predicted_first_a_token_id == true_first_a_token_id:
+                            correctness_mark = f" [Correct, conf {confidence:.2f}%]"
+                        else:
+                            correctness_mark = f" [Wrong, conf {confidence:.2f}%]"
+                    elif predicted_first_a_token_id == -1:
+                        correctness_mark = " [PRED FAILED]"
+                    elif true_first_a_token_id == config.IGNORE_INDEX:
+                         # Если истинный токен N/A (Stage 1), просто показываем предсказание и уверенность
+                         correctness_mark = f" [True N/A, conf {confidence:.2f}%]"
+
+                    # Format the final debug string
+                    predicted_str_new = f"Predict#1: {first_q} -> {pred_token_str}{correctness_mark}"
+
+                except Exception as e:
+                    # Логируем ошибку с трассировкой для лучшей диагностики
+                    import traceback
+                    print(f"[ERROR] Failed to generate debug prediction string: {e}")
+                    print(traceback.format_exc())
+                    predicted_str_new = f"Predict#1: N/A (error: {e})"
+                # --- КОНЕЦ: Формирование Predicted строки ---
+
+                # Debug printout (every 20 batches or if anomaly)
+                if i % 20 == 0 or nan_inf_found or zero_grad_found:
+                    console.print(f"--- Batch {i+1} Debug Info ---")
+                    # Print collected limit messages
+                    for msg in limit_messages:
+                        console.print(f"  [yellow]{msg}[/yellow]")
+                    limit_messages = [] # Clear the list after printing
+                    console.print(f"  Avg Loss: {avg_loss:.4f}, Acc@Target: {avg_acc*100:.2f}%")
+                    console.print(f"  Aux Var Loss: {aux_variance_loss.item():.4f}")
+                    console.print(f"  Aux LB Loss: {aux_load_balancing_loss.item():.4f}")
+                    path_display = path_str[:100] + ('...' if len(path_str) > 100 else '')
+                    console.print(f"  Path: {path_display}")
+                    console.print(f"  Q (Batch[0]): {first_q}")
+                    console.print(f"  A (Batch[0]): {first_a}")
+                    console.print(f"  {predicted_str_new}")
+                    # --- Новая строка: уверенность в правильном токене ---
+                    try:
+                        if 'pred_pos' in locals() and 'target_id' in locals():
+                            # logits: [batch, seq, vocab], берем [0, pred_pos, :]
+                            import torch.nn.functional as F
+                            true_logits = logits[0, pred_pos, :]
+                            probs = F.softmax(true_logits, dim=-1)
+                            prob_true = probs[target_id].item()
+                            console.print(f"  Model confidence in TRUE token: {prob_true*100:.2f}%")
+                    except Exception as e:
+                        console.print(f"  [yellow]Could not compute confidence: {e}[/yellow]")
+                    console.print("-" * 25)
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             # --- Отправка данных о пути в Redis ---
             if redis_client: # Отправляем только если есть соединение
@@ -395,11 +447,6 @@ def train(model, dataloader, optimizer, criterion, epoch, total_epochs, device, 
 
         if num_batches<=0 and processed_batches>0:
              epoch_progress.update(task_id,total=processed_batches)
-
-    # Close the original paths file if it was opened (though we are now using Redis)
-    if paths_file:
-        try: paths_file.close()
-        except: pass
 
     # --- Отправка Маркера Конца Эпохи в Redis ---
     if redis_client:

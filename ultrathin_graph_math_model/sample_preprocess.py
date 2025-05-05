@@ -2,7 +2,8 @@ import os
 from datasets import load_dataset
 import torch
 import numpy as np
-from transformers import AutoTokenizer
+# from transformers import AutoTokenizer # Заменяем
+import tokenizer_utils
 import config
 from dataset_utils import process_batch_for_math_mp, init_math_worker
 from rich.console import Console
@@ -18,16 +19,26 @@ IGNORE_INDEX = getattr(config, 'IGNORE_INDEX', -100)
 console.log(f"[bold cyan]MODEL_NAME:[/] {MODEL_NAME}, [bold cyan]MAX_SEQ_LEN:[/] {MAX_SEQ_LEN}, [bold cyan]IGNORE_INDEX:[/] {IGNORE_INDEX}")
 
 # === 2. Токенайзер ===
-with console.status("[bold green]Загрузка токенайзера…", spinner="dots"):
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-console.log(f"[green]Токенайзер загружен:[/] {tokenizer.__class__.__name__}")
+# with console.status("[bold green]Загрузка токенайзера…", spinner="dots"): # Удаляем ручную загрузку
+#     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# console.log(f"[green]Токенайзер загружен:[/] {tokenizer.__class__.__name__}")
+# Инициализация произойдет при первом вызове функции из tokenizer_utils
+try:
+    tokenizer_utils.get_tokenizer() # Вызовем для инициализации и вывода логов
+    console.log(f"[green]Токенайзер '{tokenizer_utils.get_tokenizer_name()}' готов к использованию.")
+except Exception as e:
+    console.print(f"[bold red]Ошибка инициализации токенизатора: {e}[/]")
+    exit(1)
+
 
 # === 3. Глобальные переменные для process_batch_for_math_mp ===
 import dataset_utils
 
-dataset_utils.tokenizer_mp = tokenizer
+# dataset_utils.tokenizer_mp = tokenizer # Больше не нужно устанавливать глобально
 dataset_utils.max_seq_len_mp = MAX_SEQ_LEN
 dataset_utils.ignore_index_mp = IGNORE_INDEX
+# init_math_worker теперь вызывается из math_train.py или другого основного скрипта
+# Здесь нам не нужно его вызывать, так как process_batch_for_math_mp будет использовать tokenizer_utils
 
 # === 4. Загрузка 3 примеров датасета ===
 with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeElapsedColumn(), TimeRemainingColumn(), console=console) as progress:
@@ -82,11 +93,14 @@ with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.descripti
     task = progress.add_task("input_ids → текст", total=len(input_ids))
     for idx, ids in enumerate(input_ids):
         arr = ids.tolist()
-        if tokenizer.pad_token_id is not None:
-            arr = [x for x in arr if x != tokenizer.pad_token_id]
-        if tokenizer.eos_token_id is not None:
-            arr = [x for x in arr if x != tokenizer.eos_token_id]
-        text = tokenizer.decode(arr, skip_special_tokens=True)
+        pad_id = tokenizer_utils.get_pad_token_id()
+        eos_id = tokenizer_utils.get_eos_token_id()
+        if pad_id is not None:
+            arr = [x for x in arr if x != pad_id]
+        if eos_id is not None:
+            arr = [x for x in arr if x != eos_id]
+        # text = tokenizer.decode(arr, skip_special_tokens=True)
+        text = tokenizer_utils.decode(arr, skip_special_tokens=True) # Используем tokenizer_utils
         console.print(f"[bold]Example {idx+1}:[/] {text}")
         progress.update(task, advance=1)
 
@@ -97,10 +111,12 @@ with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.descripti
     for idx, lbl in enumerate(labels):
         arr = lbl.tolist()
         arr = [x for x in arr if x != IGNORE_INDEX]
-        if tokenizer.pad_token_id is not None:
-            arr = [x for x in arr if x != tokenizer.pad_token_id]
-        if tokenizer.eos_token_id is not None:
-            arr = [x for x in arr if x != tokenizer.eos_token_id]
-        text = tokenizer.decode(arr, skip_special_tokens=True)
+        # pad_id и eos_id уже получены выше
+        if pad_id is not None:
+            arr = [x for x in arr if x != pad_id]
+        if eos_id is not None:
+            arr = [x for x in arr if x != eos_id]
+        # text = tokenizer.decode(arr, skip_special_tokens=True)
+        text = tokenizer_utils.decode(arr, skip_special_tokens=True) # Используем tokenizer_utils
         console.print(f"[bold]Example {idx+1}:[/] {text}")
         progress.update(task, advance=1)
